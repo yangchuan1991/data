@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>获客系统控制台</title>
+    <style>
+      body { font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #223; }
+      .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+      .card { background: #fff; padding: 18px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); margin-bottom: 16px; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }
+      .stat { background: linear-gradient(135deg, #4f46e5, #2563eb); color: white; padding: 16px; border-radius: 12px; }
+      form { display: grid; gap: 10px; }
+      input, select, textarea, button { padding: 10px; border-radius: 8px; border: 1px solid #ddd; font-size: 14px; }
+      button { background: #2563eb; color: white; cursor: pointer; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { padding: 10px; border-bottom: 1px solid #eee; text-align: left; }
+      .pill { display: inline-block; background: #e0f2fe; padding: 4px 8px; border-radius: 999px; font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>获客系统控制台</h1>
+      <p>用于抓取潜在客户线索、管理营销活动、记录核心操作并查看摘要。</p>
+
+      <div class="grid">
+        <div class="stat"><h3>线索总数</h3><div>{{ summary.lead_count }}</div></div>
+        <div class="stat"><h3>营销活动</h3><div>{{ summary.campaign_count }}</div></div>
+        <div class="stat"><h3>总预算</h3><div>{{ summary.total_budget }}</div></div>
+        <div class="stat"><h3>最近活动</h3><div>{{ summary.recent_activity }}</div></div>
+      </div>
+
+      <div class="card">
+        <h2>新增线索</h2>
+        <form method="post" action="/leads">
+          <input name="name" placeholder="姓名" required />
+          <input name="email" placeholder="邮箱" />
+          <input name="phone" placeholder="电话" />
+          <input name="company" placeholder="公司" />
+          <input name="source" placeholder="来源" />
+          <select name="status">
+            <option value="new">new</option>
+            <option value="contacted">contacted</option>
+            <option value="qualified">qualified</option>
+          </select>
+          <input name="interest" placeholder="兴趣点" />
+          <textarea name="notes" placeholder="备注"></textarea>
+          <button type="submit">保存线索</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>新增营销活动</h2>
+        <form method="post" action="/campaigns">
+          <input name="name" placeholder="活动名称" required />
+          <input name="channel" placeholder="渠道" />
+          <input name="budget" type="number" step="0.01" placeholder="预算" />
+          <input name="target" placeholder="目标客户" />
+          <select name="status">
+            <option value="running">running</option>
+            <option value="paused">paused</option>
+            <option value="completed">completed</option>
+          </select>
+          <button type="submit">创建活动</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>抓取网址</h2>
+        <form method="post" action="/crawl">
+          <input name="url" placeholder="输入网址，例如 https://example.com" required />
+          <button type="submit">抓取并记录</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h2>线索列表</h2>
+        <table>
+          <thead>
+            <tr><th>姓名</th><th>公司</th><th>状态</th><th>来源</th><th>创建时间</th></tr>
+          </thead>
+          <tbody>
+            {% for lead in leads %}
+            <tr>
+              <td>{{ lead.name }}</td>
+              <td>{{ lead.company }}</td>
+              <td><span class="pill">{{ lead.status }}</span></td>
+              <td>{{ lead.source }}</td>
+              <td>{{ lead.created_at }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>营销活动</h2>
+        <table>
+          <thead>
+            <tr><th>名称</th><th>渠道</th><th>预算</th><th>状态</th></tr>
+          </thead>
+          <tbody>
+            {% for campaign in campaigns %}
+            <tr>
+              <td>{{ campaign.name }}</td>
+              <td>{{ campaign.channel }}</td>
+              <td>{{ campaign.budget }}</td>
+              <td>{{ campaign.status }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>操作日志</h2>
+        <table>
+          <thead>
+            <tr><th>动作</th><th>详情</th><th>时间</th></tr>
+          </thead>
+          <tbody>
+            {% for item in activity %}
+            <tr>
+              <td>{{ item.action }}</td>
+              <td>{{ item.details }}</td>
+              <td>{{ item.created_at }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </body>
+</html>
