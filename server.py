@@ -1,3 +1,4 @@
+import cgi
 import csv
 import html
 import json
@@ -9,11 +10,29 @@ from urllib.parse import parse_qs, urlparse
 
 sys.dont_write_bytecode = True
 
-from app import DatabaseStore, run_crawl_pipeline
+from app import DatabaseStore, crawl_urls_once, normalize_urls, start_background_crawler
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
 store = DatabaseStore(DB_PATH)
 store.init_db()
+BACKGROUND_CRAWLER_URLS = []
+BACKGROUND_CRAWLER_STOP = None
+BACKGROUND_CRAWLER_THREAD = None
+
+
+def _ensure_background_crawler_running():
+    global BACKGROUND_CRAWLER_STOP, BACKGROUND_CRAWLER_THREAD
+    if BACKGROUND_CRAWLER_THREAD is not None and BACKGROUND_CRAWLER_THREAD.is_alive():
+        return
+    BACKGROUND_CRAWLER_THREAD, BACKGROUND_CRAWLER_STOP = start_background_crawler(
+        store,
+        urls=store.get_crawl_target_urls() or BACKGROUND_CRAWLER_URLS,
+        interval_seconds=30,
+        stop_event=None,
+    )
+
+
+_ensure_background_crawler_running()
 
 
 class CRMHandler(BaseHTTPRequestHandler):
@@ -33,6 +52,10 @@ class CRMHandler(BaseHTTPRequestHandler):
         if parsed.path == "/export.json":
             self._require_role(["admin", "manager"])
             self._send_json(store.build_report_payload())
+            return
+        if parsed.path == "/export.company.csv":
+            self._require_role(["admin", "manager"])
+            self._send_company_csv(store.build_report_payload())
             return
         if parsed.path == "/":
             if not self._is_authenticated():
@@ -56,9 +79,7 @@ class CRMHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", "0"))
-        body = self.rfile.read(length).decode("utf-8")
-        params = parse_qs(body, keep_blank_values=True)
+        params = self._parse_form_data()
 
         if parsed.path == "/login":
             username = self._get_first(params, "username", "")
@@ -126,16 +147,17 @@ class CRMHandler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/crawl":
             self._require_role(["admin", "manager"])
-            url = self._get_first(params, "url", "")
-            if url:
-                try:
-                    result = run_crawl_pipeline(url)
-                    store.add_crawl_job(url, result.get("title", ""), result.get("summary", ""), "completed")
-                    store.add_company_profile(url, result)
-                    store.log_activity("crawl_completed", f"Crawled {url} via {result.get('engine', 'unknown')}")
-                except Exception as exc:
-                    store.add_crawl_job(url, "", str(exc), "failed")
-                    store.log_activity("crawl_failed", str(exc))
+            raw_url = self._get_first(params, "targets", "").strip()
+            preferred_engine = self._get_first(params, "engine", "auto")
+            if not raw_url:
+                uploaded_value = self._get_first(params, "urls_file", "")
+                if uploaded_value:
+                    raw_url = uploaded_value
+            urls = normalize_urls(raw_url)
+            if urls:
+                store.save_crawl_targets(urls)
+                summary = crawl_urls_once(store, urls, preferred_engine=preferred_engine)
+                store.log_activity("crawl_batch_completed", f"Processed {summary['processed']} URLs, failed {summary['failed']}")
         elif parsed.path == "/messages":
             self._require_role(["admin", "manager"])
             store.add_marketing_message(
@@ -168,12 +190,23 @@ class CRMHandler(BaseHTTPRequestHandler):
 
     def _render_dashboard(self):
         summary = store.get_dashboard_summary()
+        crawl_status = [
+            item for item in store.get_activity_log()
+            if item.get("action") in {"crawl_completed", "crawl_failed", "crawl_loop_tick", "crawl_loop_error", "crawl_job_created", "crawl_targets_updated"}
+        ][:8]
+        latest_cycle = store.get_latest_crawl_cycle_summary()
         chart = store.get_dashboard_chart_data()
         leads = store.list_leads()
         campaigns = store.list_campaigns()
         messages = store.list_marketing_messages()
         crawl_jobs = store.list_crawl_jobs()
-        company_profiles = store.list_company_profiles()
+        company_filters = {
+            "company_name": self._get_query_param("company_name"),
+            "industry": self._get_query_param("industry"),
+            "region": self._get_query_param("region"),
+            "status": self._get_query_param("status"),
+        }
+        company_profiles = store.list_company_profiles(**{k: v for k, v in company_filters.items() if v})
         users = store.list_users()
         activity = store.get_activity_log()
         user = self._current_user()
@@ -191,11 +224,11 @@ class CRMHandler(BaseHTTPRequestHandler):
             for item in messages
         )
         crawl_rows = "".join(
-            f"<tr><td>{html.escape(str(item['url']))}</td><td>{html.escape(str(item['title']))}</td><td>{html.escape(str(item['summary']))}</td><td>{html.escape(str(item['status']))}</td></tr>"
+            f"<tr><td>{html.escape(str(item['url']))}</td><td>{html.escape(str(item['title']) or '-')}</td><td>{html.escape(str(item['summary']) or '-')}</td><td>{html.escape(str(item['status']))}</td></tr>"
             for item in crawl_jobs
         )
         company_rows = "".join(
-            f"<tr><td><a href='/company/{item['id']}'>{html.escape(str(item['company_name'] or ''))}</a></td><td>{html.escape(str(item['contact_name'] or ''))}</td><td>{html.escape(str(item['phone'] or ''))}</td><td>{html.escape(str(item['email'] or ''))}</td><td>{html.escape(str(item['address'] or ''))}</td><td>{html.escape(str(item['industry'] or ''))}</td><td>{html.escape(str(item['region'] or ''))}</td></tr>"
+            f"<tr><td><a href='/company/{item['id']}'>{html.escape(str(item['company_name'] or ''))}</a></td><td>{html.escape(str(item['contact_name'] or ''))}</td><td>{html.escape(str(item['phone'] or ''))}</td><td>{html.escape(str(item['email'] or ''))}</td><td>{html.escape(str(item['address'] or ''))}</td><td>{html.escape(str(item['industry'] or ''))}</td><td>{html.escape(str(item['region'] or ''))}</td><td>{html.escape(str(item['status'] or ''))}</td></tr>"
             for item in company_profiles
         )
         user_rows = "".join(
@@ -206,10 +239,15 @@ class CRMHandler(BaseHTTPRequestHandler):
             f"<tr><td>{html.escape(str(item['action']))}</td><td>{html.escape(str(item['details']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
             for item in activity
         )
+        crawl_status_rows = "".join(
+            f"<tr><td>{html.escape(str(item['action']))}</td><td>{html.escape(str(item['details']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
+            for item in crawl_status
+        )
+        configured_targets = "\n".join(store.get_crawl_target_urls())
         lead_bars = self._build_bar_chart(chart.get("lead_status_breakdown", {}), "线索状态")
         campaign_bars = self._build_bar_chart(chart.get("campaign_channel_breakdown", {}), "渠道分布")
         message_bars = self._build_bar_chart(chart.get("message_status_breakdown", {}), "营销消息状态")
-        export_links = '<a href="/export.csv">导出 CSV</a> | <a href="/export.json">导出 JSON</a> | <a href="/logout">退出登录</a>'
+        export_links = '<a href="/export.csv">导出总览 CSV</a> | <a href="/export.company.csv">导出企业 CSV</a> | <a href="/export.json">导出 JSON</a> | <a href="/logout">退出登录</a>'
         role_label = html.escape(str(user.get("role", "viewer"))) if user else "visitor"
         return f"""
         <!doctype html>
@@ -337,10 +375,25 @@ class CRMHandler(BaseHTTPRequestHandler):
 
               <div class=\"card\">
                 <h2>抓取网址</h2>
-                <form method=\"post\" action=\"/crawl\">
-                  <input name=\"url\" placeholder=\"输入网址，例如 https://example.com\" required />
-                  <button type=\"submit\">抓取并记录</button>
+                <p>后台会每 30 秒自动抓取下面的目标并写入数据库。</p>
+                <form method="post" action="/crawl" enctype="multipart/form-data">
+                  <textarea name="targets" rows="4" placeholder="可一次输入多个网址，换行或逗号分隔，例如：https://example.com&#10;https://baidu.com">{html.escape(configured_targets)}</textarea>
+                  <input type="file" name="urls_file" accept=".txt" />
+                  <input type="text" name="upload_hint" placeholder="也可以上传 .txt 文件，系统会读取每行/每逗号分隔的目标" />
+                  <select name="engine">
+                    <option value="auto">自动（优先浏览器渲染，失败回退）</option>
+                    <option value="playwright">浏览器渲染</option>
+                    <option value="standard">标准库抓取</option>
+                  </select>
+                  <button type="submit">批量抓取并记录</button>
                 </form>
+              </div>
+
+              <div class="card">
+                <h2>后台抓取状态</h2>
+                <p>最近一轮：成功 {latest_cycle['processed']}，失败 {latest_cycle['failed']}，总计 {latest_cycle['total']}</p>
+                <p>最近 8 条后台抓取事件：</p>
+                <table><thead><tr><th>动作</th><th>详情</th><th>时间</th></tr></thead><tbody>{crawl_status_rows}</tbody></table>
               </div>
 
               <div class=\"card\">
@@ -353,10 +406,20 @@ class CRMHandler(BaseHTTPRequestHandler):
                 <h2>营销消息</h2><table><thead><tr><th>渠道</th><th>内容</th><th>目标人数</th><th>状态</th></tr></thead><tbody>{message_rows}</tbody></table>
               </div>
               <div class=\"card\">
-                <h2>爬虫任务</h2><table><thead><tr><th>URL</th><th>标题</th><th>摘要</th><th>状态</th></tr></thead><tbody>{crawl_rows}</tbody></table>
+                <h2>爬虫任务</h2><table><thead><tr><th>URL</th><th>标题</th><th>摘要/原因</th><th>状态</th></tr></thead><tbody>{crawl_rows}</tbody></table>
               </div>
               <div class=\"card\">
-                <h2>抓取企业资料</h2><table><thead><tr><th>企业</th><th>联系人</th><th>电话</th><th>邮箱</th><th>办公地址</th><th>行业</th><th>区域</th></tr></thead><tbody>{company_rows}</tbody></table>
+                <h2>抓取企业资料</h2>
+                <form method="get" action="/">
+                  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">
+                    <input name="company_name" placeholder="企业名称" value="{html.escape(company_filters['company_name'])}" />
+                    <input name="industry" placeholder="行业" value="{html.escape(company_filters['industry'])}" />
+                    <input name="region" placeholder="区域" value="{html.escape(company_filters['region'])}" />
+                    <input name="status" placeholder="状态" value="{html.escape(company_filters['status'])}" />
+                    <button type="submit">筛选</button>
+                  </div>
+                </form>
+                <table><thead><tr><th>企业</th><th>联系人</th><th>电话</th><th>邮箱</th><th>办公地址</th><th>行业</th><th>区域</th><th>状态</th></tr></thead><tbody>{company_rows}</tbody></table>
               </div>
               <div class=\"card\">
                 <h2>用户与角色</h2><table><thead><tr><th>用户名</th><th>角色</th><th>创建时间</th></tr></thead><tbody>{user_rows}</tbody></table>
@@ -420,9 +483,33 @@ class CRMHandler(BaseHTTPRequestHandler):
             )
         return f"<div><strong>{html.escape(title)}</strong><div class=\"bar-chart\">{' '.join(rows)}</div></div>"
 
+    def _parse_form_data(self):
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.startswith("multipart/form-data"):
+            environ = {"REQUEST_METHOD": "POST", "CONTENT_TYPE": content_type}
+            form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ=environ)
+            params = {}
+            for key in form.keys():
+                item = form[key]
+                if item.filename:
+                    value = item.file.read().decode("utf-8", errors="ignore")
+                else:
+                    value = item.value
+                params[key] = [value]
+            return params
+
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length).decode("utf-8")
+        return parse_qs(body, keep_blank_values=True)
+
     def _get_first(self, params, key, default=""):
         values = params.get(key, [])
         return values[0] if values else default
+
+    def _get_query_param(self, key):
+        parsed = urlparse(self.path)
+        values = parse_qs(parsed.query).get(key, [])
+        return values[0] if values else ""
 
     def _is_authenticated(self):
         cookie = self.headers.get("Cookie", "")
@@ -491,6 +578,19 @@ class CRMHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body.encode("utf-8"))
 
+    def _send_company_csv(self, payload):
+        output = ["company_name,contact_name,phone,email,address,industry,region,status\n"]
+        for row in payload.get("company_profiles", []):
+            output.append(
+                f"{row.get('company_name','')},{row.get('contact_name','')},{row.get('phone','')},{row.get('email','')},{row.get('address','')},{row.get('industry','')},{row.get('region','')},{row.get('status','')}\n"
+            )
+        body = "".join(output)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Length", str(len(body.encode("utf-8"))))
+        self.end_headers()
+        self.wfile.write(body.encode("utf-8"))
+
     def _send_json(self, payload):
         body = json.dumps(payload, ensure_ascii=False, indent=2)
         self.send_response(200)
@@ -502,23 +602,21 @@ class CRMHandler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     host = "127.0.0.1"
-    configured_port = os.getenv("PORT", "0")
+    configured_port = os.getenv("PORT", "8000")
     try:
         preferred_port = int(configured_port)
     except ValueError:
-        preferred_port = 0
+        preferred_port = 8000
 
+    candidate_ports = [preferred_port, preferred_port + 1, 8000, 8001, 8002]
     server = None
     last_error = None
-    for port in [preferred_port if preferred_port > 0 else 0, 0]:
+    for port in candidate_ports:
         try:
             server = HTTPServer((host, port), CRMHandler)
             break
         except OSError as exc:
             last_error = exc
-            if port != 0:
-                continue
-            raise
     if server is None:
         raise last_error
     print(f"Server started at http://{host}:{server.server_address[1]}")

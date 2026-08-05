@@ -1,0 +1,14 @@
+[Unit]
+Description=CRM Crawler Service
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/crm_project
+Environment=PYTHONPATH=/opt/crm_project
+ExecStart=/opt/crm_project/.venv/bin/python /opt/crm_project/server.py
+Restart=always
+User=www-data
+Group=www-data
+
+[Install]
+WantedBy=multi-user.target

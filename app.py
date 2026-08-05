@@ -1,11 +1,19 @@
 import hashlib
+import json
 import re
 import sqlite3
 import sys
+import threading
+import time
 import urllib.request
 from html import unescape
 from html.parser import HTMLParser
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
+
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+except Exception:  # pragma: no cover
+    sync_playwright = None
 
 sys.dont_write_bytecode = True
 
@@ -84,6 +92,25 @@ class DatabaseStore:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS crawl_target_urls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL UNIQUE,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crawl_cycle_stats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                processed INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS company_profiles (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 url TEXT NOT NULL,
@@ -95,10 +122,15 @@ class DatabaseStore:
                 industry TEXT,
                 region TEXT,
                 raw_text TEXT,
+                status TEXT DEFAULT 'new',
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        try:
+            cur.execute("ALTER TABLE company_profiles ADD COLUMN status TEXT DEFAULT 'new'")
+        except sqlite3.OperationalError:
+            pass
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS activity_log (
@@ -220,17 +252,108 @@ class DatabaseStore:
         self.log_activity("crawl_job_created", f"Captured crawl job {url}")
         return job_id
 
-    def add_company_profile(self, url, profile_data):
+    def save_crawl_targets(self, urls):
+        normalized_urls = []
+        if isinstance(urls, str):
+            candidate_urls = normalize_urls(urls)
+        else:
+            candidate_urls = normalize_urls("\n".join([str(item) for item in (urls or [])]))
+        for item in candidate_urls:
+            if item and item.strip():
+                normalized_urls.append(item.strip())
         conn = sqlite3.connect(self.db_path)
         cur = conn.cursor()
+        cur.execute("DELETE FROM crawl_target_urls")
+        for item in normalized_urls:
+            cur.execute("INSERT INTO crawl_target_urls (url) VALUES (?)", (item,))
+        conn.commit()
+        conn.close()
+        self.log_activity("crawl_targets_updated", f"Configured {len(normalized_urls)} crawl targets")
+        return normalized_urls
+
+    def get_crawl_target_urls(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        rows = cur.execute("SELECT url FROM crawl_target_urls ORDER BY id ASC").fetchall()
+        conn.close()
+        return [row["url"] for row in rows]
+
+    def get_latest_crawl_cycle_summary(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        row = cur.execute("SELECT processed, failed, created_at FROM crawl_cycle_stats ORDER BY id DESC LIMIT 1").fetchone()
+        conn.close()
+        if not row:
+            return {"processed": 0, "failed": 0, "total": 0, "created_at": None}
+        return {
+            "processed": row["processed"],
+            "failed": row["failed"],
+            "total": row["processed"] + row["failed"],
+            "created_at": row["created_at"],
+        }
+
+    def _normalize_profile_url(self, url):
+        if not url:
+            return None
+        value = str(url).strip()
+        if not value:
+            return None
+        parsed = urlparse(value)
+        if not parsed.scheme:
+            value = f"https://{value}"
+            parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        netloc = parsed.netloc.lower()
+        path = parsed.path.rstrip("/") or "/"
+        return f"{scheme}://{netloc}{path}"
+
+    def add_company_profile(self, url, profile_data):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        normalized_url = self._normalize_profile_url(url) or self._normalize_profile_url(profile_data.get("url"))
+        if normalized_url:
+            existing_row = cur.execute(
+                "SELECT id FROM company_profiles WHERE lower(url) = lower(?)",
+                (normalized_url,),
+            ).fetchone()
+            if existing_row:
+                profile_id = existing_row["id"]
+                cur.execute(
+                    """
+                    UPDATE company_profiles
+                    SET url = ?, company_name = ?, contact_name = ?, phone = ?, email = ?, address = ?, industry = ?, region = ?, raw_text = ?, status = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        normalized_url,
+                        profile_data.get("company_name"),
+                        profile_data.get("contact_name"),
+                        profile_data.get("phone"),
+                        profile_data.get("email"),
+                        profile_data.get("address"),
+                        profile_data.get("industry"),
+                        profile_data.get("region"),
+                        profile_data.get("raw_text"),
+                        "updated",
+                        profile_id,
+                    ),
+                )
+                conn.commit()
+                conn.close()
+                self.log_activity("company_profile_updated", f"Updated company profile for {normalized_url}")
+                return profile_id
+
         cur.execute(
             """
             INSERT INTO company_profiles (
-                url, company_name, contact_name, phone, email, address, industry, region, raw_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                url, company_name, contact_name, phone, email, address, industry, region, raw_text, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                url,
+                normalized_url or url,
                 profile_data.get("company_name"),
                 profile_data.get("contact_name"),
                 profile_data.get("phone"),
@@ -239,19 +362,35 @@ class DatabaseStore:
                 profile_data.get("industry"),
                 profile_data.get("region"),
                 profile_data.get("raw_text"),
+                "new",
             ),
         )
         profile_id = cur.lastrowid
         conn.commit()
         conn.close()
-        self.log_activity("company_profile_created", f"Captured company profile for {url}")
+        self.log_activity("company_profile_created", f"Captured company profile for {normalized_url or url}")
         return profile_id
 
-    def list_company_profiles(self):
+    def list_company_profiles(self, company_name=None, industry=None, region=None, status=None):
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM company_profiles ORDER BY created_at DESC").fetchall()
+        query = "SELECT * FROM company_profiles WHERE 1=1"
+        params = []
+        if company_name:
+            query += " AND company_name LIKE ?"
+            params.append(f"%{company_name}%")
+        if industry:
+            query += " AND industry LIKE ?"
+            params.append(f"%{industry}%")
+        if region:
+            query += " AND region LIKE ?"
+            params.append(f"%{region}%")
+        if status:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY created_at DESC"
+        rows = cur.execute(query, params).fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
@@ -269,7 +408,7 @@ class DatabaseStore:
         cur.execute(
             """
             UPDATE company_profiles
-            SET company_name = ?, contact_name = ?, phone = ?, email = ?, address = ?, industry = ?, region = ?, url = ?
+            SET company_name = ?, contact_name = ?, phone = ?, email = ?, address = ?, industry = ?, region = ?, url = ?, status = ?
             WHERE id = ?
             """,
             (
@@ -281,6 +420,7 @@ class DatabaseStore:
                 profile_data.get("industry"),
                 profile_data.get("region"),
                 profile_data.get("url"),
+                profile_data.get("status") or "updated",
                 profile_id,
             ),
         )
@@ -396,6 +536,7 @@ class DatabaseStore:
             "messages": self.list_marketing_messages(),
             "crawls": self.list_crawl_jobs(),
             "users": self.list_users(),
+            "company_profiles": self.list_company_profiles(),
         }
 
     def send_message(self, channel, content, recipient_count, status="queued"):
@@ -433,53 +574,193 @@ class ContentParser(HTMLParser):
 
 def fetch_url_content(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(req, timeout=15) as response:
-        return response.read().decode("utf-8", errors="ignore")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            body = response.read().decode("utf-8", errors="ignore")
+            if not body or not body.strip():
+                raise ValueError("抓取到的页面内容为空")
+            return body
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"HTTP {exc.code}: {exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"网络访问失败: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise ValueError("请求超时，请重试") from exc
+    except Exception as exc:
+        raise ValueError(f"抓取失败: {exc}") from exc
 
 
-def _extract_company_profile(text, title, base_url):
+def _extract_company_profile(text, title, base_url, html_text=""):
     cleaned = re.sub(r"\s+", " ", text).strip()
+    source_html = html_text or text
     company_name = None
     contact_name = None
     phone = None
     email = None
     address = None
     industry = None
-    region = "北京"
+    region = None
 
     if title:
-        company_name = title.strip()
-    for pattern in [
-        r"公司名称[:：]\s*(.*?)(?=(?:联系人|负责人|电话|手机|邮箱|办公地址|地址|行业|公司名称|企业名称|名称|$))",
-        r"企业名称[:：]\s*(.*?)(?=(?:联系人|负责人|电话|手机|邮箱|办公地址|地址|行业|公司名称|企业名称|名称|$))",
-        r"名称[:：]\s*(.*?)(?=(?:联系人|负责人|电话|手机|邮箱|办公地址|地址|行业|公司名称|企业名称|名称|$))",
-    ]:
-        m = re.search(pattern, cleaned)
-        if m:
-            candidate = re.sub(r"\s+", " ", m.group(1)).strip()
-            if candidate:
-                company_name = candidate
-                break
-    for pattern in [
-        r"联系人[:：]\s*(.*?)(?=(?:电话|手机|邮箱|办公地址|地址|行业|公司名称|企业名称|名称|\s*\S+[:：]))",
-        r"负责人[:：]\s*(.*?)(?=(?:电话|手机|邮箱|办公地址|地址|行业|公司名称|企业名称|名称|\s*\S+[:：]))",
-    ]:
-        m = re.search(pattern, cleaned)
-        if m:
-            contact_name = re.sub(r"\s+", " ", m.group(1)).strip()
-            break
-    phone_match = re.search(r"(?:电话|手机)[:：]?\s*(1[3-9]\d{9}|\d{3,4}-\d{7,8})", cleaned)
-    if phone_match:
-        phone = phone_match.group(1).strip()
-    email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", cleaned)
-    if email_match:
-        email = email_match.group(0)
-    address_match = re.search(r"办公地址[:：]\s*(.*?)(?=(?:电话|手机|邮箱|行业|公司名称|企业名称|名称|\s*\S+[:：]|$))", cleaned)
-    if address_match:
-        address = re.sub(r"\s+", " ", address_match.group(1)).strip()
-    industry_match = re.search(r"行业[:：]\s*(.*?)(?=(?:电话|手机|邮箱|办公地址|地址|公司名称|企业名称|名称|\s*\S+[:：]|$))", cleaned)
-    if industry_match:
-        industry = re.sub(r"\s+", " ", industry_match.group(1)).strip()
+        title_text = title.strip()
+        if "|" in title_text:
+            title_text = title_text.split("|")[-1].strip()
+        if "-" in title_text:
+            title_text = title_text.split("-")[-1].strip()
+        company_name = title_text or title.strip()
+
+    def _first_match(patterns, source=cleaned):
+        for pattern in patterns:
+            match = re.search(pattern, source)
+            if match:
+                value = re.sub(r"\s+", " ", match.group(1)).strip() if match.lastindex else match.group(0)
+                if value:
+                    return value
+        return None
+
+    def _normalize_phone(value):
+        if not value:
+            return None
+        text = str(value).strip()
+        match = re.search(r"(1[3-9]\d{9}|\d{3,4}[-－]?\d{7,8})", text)
+        if match:
+            return match.group(1)
+        digits = re.sub(r"\D", "", text)
+        if len(digits) >= 11:
+            return digits[-11:]
+        return text
+
+    def _normalize_email(value):
+        if not value:
+            return None
+        match = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", value)
+        return match.group(1) if match else value.strip()
+
+    def _normalize_address(value):
+        if not value:
+            return None
+        text = re.sub(r"\s+", " ", str(value)).strip()
+        if text.endswith(("北京", "上海", "广州", "深圳", "天津", "重庆", "香港", "澳门")):
+            text = text.rsplit(" ", 1)[0]
+        return text
+
+    def _normalize_region(value):
+        if not value:
+            return None
+        match = re.search(r"(北京|上海|广州|深圳|天津|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门)", value)
+        return match.group(1) if match else None
+
+    # Try common structured metadata first.
+    meta_patterns = [
+        ("company_name", [r"<meta[^>]+property=[\"']og:site_name[\"'][^>]+content=[\"']([^\"']+)[\"']", r"<meta[^>]+name=[\"']application-name[\"'][^>]+content=[\"']([^\"']+)[\"']"]),
+        ("phone", [r"<meta[^>]+itemprop=[\"']telephone[\"'][^>]+content=[\"']([^\"']+)[\"']", r"<meta[^>]+name=[\"']tel[\"'][^>]+content=[\"']([^\"']+)[\"']"]),
+        ("email", [r"<meta[^>]+itemprop=[\"']email[\"'][^>]+content=[\"']([^\"']+)[\"']", r"<meta[^>]+name=[\"']email[\"'][^>]+content=[\"']([^\"']+)[\"']"]),
+        ("address", [r"<meta[^>]+itemprop=[\"']address[\"'][^>]+content=[\"']([^\"']+)[\"']"]),
+    ]
+    for field, patterns in meta_patterns:
+        value = _first_match(patterns, source_html)
+        if value:
+            value = re.sub(r"<[^>]+>", " ", value)
+            value = re.sub(r"\s+", " ", value).strip()
+            if field == "company_name":
+                company_name = value
+            elif field == "phone":
+                phone = _normalize_phone(value)
+            elif field == "email":
+                email = _normalize_email(value)
+            elif field == "address":
+                address = _normalize_address(value)
+
+    # JSON-LD / schema.org structured data.
+    for schema_match in re.finditer(r"<script[^>]+type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", source_html, re.I | re.S):
+        payload = schema_match.group(1)
+        try:
+            data = json.loads(payload)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            if not company_name and data.get("name"):
+                company_name = str(data["name"]).strip()
+            if not phone and data.get("telephone"):
+                phone = _normalize_phone(str(data["telephone"]))
+            if not email and data.get("email"):
+                email = _normalize_email(str(data["email"]))
+            if not address and data.get("address"):
+                if isinstance(data["address"], dict):
+                    parts = []
+                    if data["address"].get("streetAddress"):
+                        parts.append(str(data["address"].get("streetAddress")))
+                    if data["address"].get("addressRegion"):
+                        parts.append(str(data["address"].get("addressRegion")))
+                    if parts:
+                        address = _normalize_address(" ".join(parts))
+                else:
+                    address = _normalize_address(str(data["address"]))
+            if not industry and data.get("industry"):
+                industry = str(data["industry"]).strip()
+        elif isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    if not company_name and item.get("name"):
+                        company_name = str(item["name"]).strip()
+                    if not phone and item.get("telephone"):
+                        phone = _normalize_phone(str(item["telephone"]))
+                    if not email and item.get("email"):
+                        email = _normalize_email(str(item["email"]))
+                    if not address and item.get("address"):
+                        if isinstance(item["address"], dict):
+                            parts = []
+                            if item["address"].get("streetAddress"):
+                                parts.append(str(item["address"].get("streetAddress")))
+                            if item["address"].get("addressRegion"):
+                                parts.append(str(item["address"].get("addressRegion")))
+                            if parts:
+                                address = _normalize_address(" ".join(parts))
+                        else:
+                            address = _normalize_address(str(item["address"]))
+                    if not industry and item.get("industry"):
+                        industry = str(item["industry"]).strip()
+
+    company_name = _first_match([
+        r"(?:公司名称|企业名称|单位名称|机构名称|公司名|企业名)[:：]\s*(.*?)(?=(?:联系人|负责人|联系电话|联系手机|电话|手机|邮箱|电子邮箱|办公地址|公司地址|地址|行业|主营业务|主营|所在地区|区域|$))",
+        r"(?:名称)[:：]\s*(.*?)(?=(?:联系人|负责人|联系电话|联系手机|电话|手机|邮箱|电子邮箱|办公地址|公司地址|地址|行业|主营业务|主营|所在地区|区域|$))",
+    ]) or company_name
+
+    contact_name = _first_match([
+        r"(?:联系人|负责人|业务联系人|项目负责人)[:：]\s*(.*?)(?=(?:联系电话|联系手机|电话|手机|邮箱|电子邮箱|办公地址|公司地址|地址|行业|主营业务|主营|所在地区|区域|$))",
+    ])
+
+    if not phone:
+        phone_match = re.search(r"(?:联系电话|联系手机|手机号|电话|手机)[:：]?\s*(1[3-9]\d{9}|\d{3,4}[-－]?\d{7,8})", cleaned)
+        if phone_match:
+            phone = _normalize_phone(phone_match.group(1).strip())
+
+    if not email:
+        email_match = re.search(r"(?:邮箱|电子邮箱|联系邮箱|email)[:：]?\s*([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", cleaned)
+        if email_match:
+            email = _normalize_email(email_match.group(1))
+        elif re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", cleaned):
+            email = _normalize_email(re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", cleaned).group(0))
+
+    if not address:
+        address = _first_match([
+            r"(?:办公地址|公司地址|联系地址|地址)[:：]\s*(.*?)(?=(?:联系人|负责人|联系电话|联系手机|手机号|电话|手机|邮箱|电子邮箱|联系邮箱|行业|主营业务|主营|所在地区|区域|$))",
+        ])
+        address = _normalize_address(address)
+
+    if not industry:
+        industry = _first_match([
+            r"(?:行业|主营业务|业务范围|主营|业务类别)[:：]\s*(.*?)(?=(?:联系人|负责人|联系电话|联系手机|手机号|电话|手机|邮箱|电子邮箱|联系邮箱|办公地址|公司地址|地址|所在地区|区域|$))",
+        ])
+
+    if not region:
+        region_match = re.search(r"(?:所在地区|地区|区域|城市)[:：]\s*(北京|上海|广州|深圳|天津|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门)", cleaned)
+        if region_match:
+            region = region_match.group(1)
+        elif address:
+            region = _normalize_region(address)
+    if region is None:
+        region = "北京"
 
     return {
         "company_name": company_name,
@@ -491,6 +772,19 @@ def _extract_company_profile(text, title, base_url):
         "region": region,
         "raw_text": cleaned,
     }
+
+
+def normalize_urls(raw_value):
+    items = []
+    for line in str(raw_value or "").replace("\r", "\n").splitlines():
+        for chunk in line.split(","):
+            candidate = chunk.strip()
+            if not candidate:
+                continue
+            if not candidate.startswith(("http://", "https://")):
+                candidate = f"https://{candidate}"
+            items.append(candidate)
+    return items
 
 
 def parse_html_content(html_text, base_url):
@@ -506,13 +800,43 @@ def parse_html_content(html_text, base_url):
             links.append(link)
         else:
             links.append(urljoin(base_url, link))
-    profile = _extract_company_profile(text, title, base_url)
+    profile = _extract_company_profile(text, title, base_url, html_text)
     result = {"title": title, "summary": unescape(summary), "links": links}
     result.update(profile)
     return result
 
 
-def run_crawl_pipeline(url):
+def _fetch_with_playwright(url):
+    if sync_playwright is None:
+        raise RuntimeError("playwright not available")
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30000)
+        html = page.content()
+        browser.close()
+        return html
+
+
+def run_crawl_pipeline(url, preferred_engine="auto"):
+    if preferred_engine == "playwright":
+        try:
+            html = _fetch_with_playwright(url)
+            result = parse_html_content(html, url)
+            result["engine"] = "playwright"
+            return result
+        except Exception as exc:
+            raise ValueError(f"浏览器渲染抓取失败: {exc}") from exc
+
+    if preferred_engine in {"auto", "playwright"}:
+        try:
+            html = _fetch_with_playwright(url)
+            result = parse_html_content(html, url)
+            result["engine"] = "playwright"
+            return result
+        except Exception:
+            pass
+
     try:
         import scrapy  # type: ignore
 
@@ -521,9 +845,84 @@ def run_crawl_pipeline(url):
         result["engine"] = "scrapy"
         return result
     except Exception:
-        result = parse_html_content(fetch_url_content(url), url)
-        result["engine"] = "standard-library"
-        return result
+        try:
+            result = parse_html_content(fetch_url_content(url), url)
+            result["engine"] = "standard-library"
+            return result
+        except Exception as secondary_exc:
+            return {
+                "title": "",
+                "summary": str(secondary_exc),
+                "links": [],
+                "company_name": None,
+                "contact_name": None,
+                "phone": None,
+                "email": None,
+                "address": None,
+                "industry": None,
+                "region": "北京",
+                "raw_text": str(secondary_exc),
+                "engine": "failed",
+            }
+
+
+def crawl_urls_once(store, urls, preferred_engine="auto"):
+    processed = 0
+    failed = 0
+    for url in urls:
+        try:
+            result = run_crawl_pipeline(url, preferred_engine=preferred_engine)
+            store.add_crawl_job(url, result.get("title", ""), result.get("summary", ""), "completed")
+            store.add_company_profile(url, result)
+            store.log_activity("crawl_completed", f"Crawled {url} via {result.get('engine', 'unknown')}")
+            processed += 1
+        except Exception as exc:
+            reason = str(exc)
+            store.add_crawl_job(url, "", reason, "failed")
+            store.log_activity("crawl_failed", reason)
+            failed += 1
+    summary = {"processed": processed, "failed": failed, "total": processed + failed}
+    record_crawl_cycle_summary(store, summary["processed"], summary["failed"])
+    return summary
+
+
+def record_crawl_cycle_summary(store, processed, failed):
+    conn = sqlite3.connect(store.db_path)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO crawl_cycle_stats (processed, failed) VALUES (?, ?)",
+        (processed, failed),
+    )
+    conn.commit()
+    conn.close()
+    return {"processed": processed, "failed": failed, "total": processed + failed}
+
+
+def start_background_crawler(store, urls=None, interval_seconds=30, stop_event=None):
+    if stop_event is None:
+        stop_event = threading.Event()
+    if urls is None:
+        target_urls = store.get_crawl_target_urls()
+    else:
+        target_urls = [item.strip() for item in (urls or []) if item and item.strip()]
+    if not target_urls:
+        target_urls = ["https://example.com"]
+
+    def _runner():
+        while not stop_event.is_set():
+            try:
+                summary = crawl_urls_once(store, target_urls, preferred_engine="standard")
+                store.log_activity(
+                    "crawl_loop_tick",
+                    f"Background crawl tick processed {summary['processed']} URLs, failed {summary['failed']}",
+                )
+            except Exception as exc:
+                store.log_activity("crawl_loop_error", str(exc))
+            stop_event.wait(interval_seconds)
+
+    thread = threading.Thread(target=_runner, daemon=True, name="background-crawler")
+    thread.start()
+    return thread, stop_event
 
 
 def main():

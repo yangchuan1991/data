@@ -2,7 +2,14 @@ import os
 import tempfile
 import unittest
 
-from app import DatabaseStore, parse_html_content
+from app import (
+    DatabaseStore,
+    crawl_urls_once,
+    normalize_urls,
+    parse_html_content,
+    record_crawl_cycle_summary,
+    run_crawl_pipeline,
+)
 
 
 class AppLogicTests(unittest.TestCase):
@@ -145,6 +152,137 @@ class AppLogicTests(unittest.TestCase):
         profile = self.store.get_company_profile(profile_id)
         self.assertEqual("李小姐", profile["contact_name"])
         self.assertEqual("13900000000", profile["phone"])
+
+    def test_company_profile_parsing_with_common_labels(self):
+        html = """
+        <html>
+          <body>
+            <h1>北京XX科技有限公司</h1>
+            <p>公司名称：北京XX科技有限公司</p>
+            <p>联系人：张先生</p>
+            <p>联系电话：13800000000</p>
+            <p>电子邮箱：zhang@example.com</p>
+            <p>公司地址：北京市朝阳区望京SOHO</p>
+            <p>主营业务：软件研发</p>
+            <p>所在地区：北京</p>
+          </body>
+        </html>
+        """
+        result = parse_html_content(html, "https://example.com")
+        self.assertEqual("北京XX科技有限公司", result["company_name"])
+        self.assertEqual("张先生", result["contact_name"])
+        self.assertEqual("13800000000", result["phone"])
+        self.assertEqual("zhang@example.com", result["email"])
+        self.assertEqual("北京市朝阳区望京SOHO", result["address"])
+        self.assertEqual("软件研发", result["industry"])
+        self.assertEqual("北京", result["region"])
+
+    def test_company_profile_parsing_with_phone_label_variants(self):
+        html = """
+        <html>
+          <body>
+            <h1>北京XX科技有限公司</h1>
+            <p>公司名称：北京XX科技有限公司</p>
+            <p>联系人：张先生</p>
+            <p>手机号：13800000000</p>
+            <p>联系邮箱：zhang@example.com</p>
+            <p>公司地址：北京市朝阳区望京SOHO</p>
+            <p>主营业务：软件研发</p>
+            <p>所在地区：北京</p>
+          </body>
+        </html>
+        """
+        result = parse_html_content(html, "https://example.com")
+        self.assertEqual("13800000000", result["phone"])
+        self.assertEqual("zhang@example.com", result["email"])
+
+    def test_company_profile_parsing_from_jsonld_and_meta_tags(self):
+        html = """
+        <html>
+          <head>
+            <title>关于我们 | 智链科技</title>
+            <meta property="og:site_name" content="智链科技" />
+            <meta name="description" content="专注智能制造解决方案" />
+            <script type="application/ld+json">
+              {
+                "@context": "https://schema.org",
+                "@type": "Organization",
+                "name": "智链科技",
+                "telephone": "+86-13800000000",
+                "email": "contact@zhilian.com",
+                "address": {
+                  "streetAddress": "北京市朝阳区望京SOHO",
+                  "addressRegion": "北京"
+                },
+                "industry": "人工智能"
+              }
+            </script>
+          </head>
+          <body>
+            <h1>智链科技</h1>
+            <p>我们提供智能制造解决方案</p>
+          </body>
+        </html>
+        """
+        result = parse_html_content(html, "https://example.com")
+        self.assertEqual("智链科技", result["company_name"])
+        self.assertEqual("13800000000", result["phone"])
+        self.assertEqual("contact@zhilian.com", result["email"])
+        self.assertEqual("北京市朝阳区望京SOHO", result["address"])
+        self.assertEqual("人工智能", result["industry"])
+        self.assertEqual("北京", result["region"])
+
+    def test_normalize_urls_supports_multiple_inputs(self):
+        urls = normalize_urls("https://example.com\nhttps://baidu.com, https://bing.com")
+        self.assertEqual(["https://example.com", "https://baidu.com", "https://bing.com"], urls)
+
+    def test_run_crawl_pipeline_uses_standard_library_fallback(self):
+        result = run_crawl_pipeline("https://example.com", preferred_engine="standard")
+        self.assertIn("engine", result)
+        self.assertTrue(result.get("title") or result.get("summary") or result.get("raw_text"))
+
+    def test_crawl_urls_once_persists_results(self):
+        summary = crawl_urls_once(self.store, ["https://example.com"], preferred_engine="standard")
+        self.assertEqual(1, summary["processed"])
+        jobs = self.store.list_crawl_jobs()
+        self.assertEqual(1, len(jobs))
+        self.assertEqual("https://example.com", jobs[0]["url"])
+
+    def test_crawl_targets_can_be_saved_and_loaded(self):
+        self.store.save_crawl_targets(["https://example.com", "https://baidu.com"])
+        self.assertEqual(["https://example.com", "https://baidu.com"], self.store.get_crawl_target_urls())
+
+    def test_record_crawl_cycle_summary_writes_visible_stats(self):
+        record_crawl_cycle_summary(self.store, 3, 1)
+        latest = self.store.get_latest_crawl_cycle_summary()
+        self.assertEqual(3, latest["processed"])
+        self.assertEqual(1, latest["failed"])
+
+    def test_company_profile_deduplicates_and_adds_status(self):
+        first_id = self.store.add_company_profile(
+            "https://example.com",
+            {"company_name": "Acme", "phone": "13800000000", "email": "a@example.com", "industry": "AI", "region": "北京"},
+        )
+        second_id = self.store.add_company_profile(
+            "https://example.com",
+            {"company_name": "Acme", "phone": "13900000000", "email": "b@example.com", "industry": "人工智能", "region": "上海"},
+        )
+        self.assertEqual(first_id, second_id)
+        profiles = self.store.list_company_profiles()
+        self.assertEqual(1, len(profiles))
+        self.assertEqual("updated", profiles[0]["status"])
+        self.assertEqual("13900000000", profiles[0]["phone"])
+        self.assertEqual("上海", profiles[0]["region"])
+
+    def test_company_profile_filters(self):
+        self.store.add_company_profile("https://a.com", {"company_name": "Alpha", "industry": "AI", "region": "北京"})
+        self.store.add_company_profile("https://b.com", {"company_name": "Beta", "industry": "金融", "region": "深圳"})
+        filtered = self.store.list_company_profiles(company_name="Alpha")
+        self.assertEqual(1, len(filtered))
+        self.assertEqual("Alpha", filtered[0]["company_name"])
+        filtered_by_industry = self.store.list_company_profiles(industry="金融")
+        self.assertEqual(1, len(filtered_by_industry))
+        self.assertEqual("深圳", filtered_by_industry[0]["region"])
 
     def test_auth_and_export_payload(self):
         self.store.create_user("analyst", "secret", "viewer")
