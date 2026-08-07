@@ -1,11 +1,12 @@
 import os
+import sys
 import threading
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from app import DatabaseStore, crawl_urls_once
+from app import DatabaseStore, crawl_urls_once, start_background_crawler
 
 
 class CrawlRequest(BaseModel):
@@ -36,12 +37,45 @@ class MonitoringService:
 
 
 monitoring = MonitoringService()
+_BACKGROUND_CRAWLER_STATE = {}
+
+
+def _should_start_background_crawler(auto_start=True):
+    if os.environ.get("CRM_DISABLE_BACKGROUND_CRAWLER", "").lower() in {"1", "true", "yes", "on"}:
+        return False
+    if not auto_start:
+        return False
+    if "pytest" in sys.modules:
+        return False
+    return True
+
+
+def _ensure_background_crawler_running(store, urls=None, interval_seconds=30, auto_start=True):
+    if not _should_start_background_crawler(auto_start=auto_start):
+        return None, None
+
+    store.init_db()
+    state_key = getattr(store, "db_path", str(store))
+    state = _BACKGROUND_CRAWLER_STATE.get(state_key)
+    if state and state["thread"].is_alive():
+        return state["thread"], state["stop_event"]
+
+    stop_event = threading.Event()
+    thread, stop_event = start_background_crawler(
+        store,
+        urls=urls,
+        interval_seconds=interval_seconds,
+        stop_event=stop_event,
+    )
+    _BACKGROUND_CRAWLER_STATE[state_key] = {"thread": thread, "stop_event": stop_event}
+    return thread, stop_event
 
 
 def create_app(db_path: Optional[str] = None) -> FastAPI:
-    resolved_db_path = db_path or os.environ.get("CRM_DB_PATH", os.path.join(os.path.dirname(__file__), "data.db"))
+    resolved_db_path = db_path or os.environ.get("CRM_DB_PATH")
     store = DatabaseStore(resolved_db_path)
     store.init_db()
+    _ensure_background_crawler_running(store, interval_seconds=30, auto_start=not bool(os.environ.get("PYTEST_CURRENT_TEST")))
 
     app = FastAPI(title="CRM Crawler API", version="1.0.0")
 
@@ -67,6 +101,7 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="urls cannot be empty")
         urls = [item.strip() for item in payload.urls if item and item.strip()]
         store.save_crawl_targets(urls)
+        _ensure_background_crawler_running(store, urls=urls, interval_seconds=30)
         summary = crawl_urls_once(store, urls, preferred_engine=payload.engine)
         monitoring.add_event("crawl_submitted", f"processed={summary['processed']} failed={summary['failed']}")
         return CrawlResponse(status="queued", queued=len(urls), message="crawl accepted")

@@ -1,7 +1,7 @@
 import hashlib
 import json
+import os
 import re
-import sqlite3
 import sys
 import threading
 import time
@@ -19,17 +19,45 @@ sys.dont_write_bytecode = True
 
 
 class DatabaseStore:
-    def __init__(self, db_path="data.db"):
+    def __init__(self, db_path=None):
         self.db_path = db_path
+        self.use_postgres = True
+
+    def _connect(self):
+        dsn = os.environ.get("CRM_POSTGRES_DSN")
+        if not dsn:
+            raise RuntimeError("CRM_POSTGRES_DSN must be set to a PostgreSQL connection string")
+
+        import psycopg2
+
+        conn = psycopg2.connect(dsn)
+        self.use_postgres = True
+        return conn
+
+    def _cursor(self, conn):
+        from psycopg2.extras import RealDictCursor
+
+        return conn.cursor(cursor_factory=RealDictCursor)
+
+    def _sql(self, sql):
+        return sql.replace("?", "%s")
+
+    def _normalize_row(self, row):
+        if row is None:
+            return None
+        if hasattr(row, "keys"):
+            return dict(row)
+        if isinstance(row, (tuple, list)):
+            return row
+        return row
 
     def init_db(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS leads (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 email TEXT,
                 phone TEXT,
@@ -38,81 +66,81 @@ class DatabaseStore:
                 status TEXT,
                 interest TEXT,
                 notes TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS campaigns (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
                 channel TEXT,
                 budget REAL DEFAULT 0,
                 target TEXT,
                 status TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS marketing_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 channel TEXT NOT NULL,
                 content TEXT NOT NULL,
                 recipient_count INTEGER DEFAULT 0,
                 status TEXT DEFAULT 'queued',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
                 role TEXT NOT NULL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS crawl_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 url TEXT NOT NULL,
                 title TEXT,
                 summary TEXT,
                 status TEXT DEFAULT 'completed',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS crawl_target_urls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 url TEXT NOT NULL UNIQUE,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS crawl_cycle_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 processed INTEGER DEFAULT 0,
                 failed INTEGER DEFAULT 0,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS company_profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 url TEXT NOT NULL,
                 company_name TEXT,
                 contact_name TEXT,
@@ -123,21 +151,18 @@ class DatabaseStore:
                 region TEXT,
                 raw_text TEXT,
                 status TEXT DEFAULT 'new',
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
-        try:
-            cur.execute("ALTER TABLE company_profiles ADD COLUMN status TEXT DEFAULT 'new'")
-        except sqlite3.OperationalError:
-            pass
+        cur.execute("ALTER TABLE company_profiles ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'new'")
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS activity_log (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 action TEXT NOT NULL,
                 details TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
@@ -145,49 +170,73 @@ class DatabaseStore:
         conn.close()
         self._ensure_default_admin_user()
 
+    def reset_db(self):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        for table_name in [
+            "activity_log",
+            "company_profiles",
+            "crawl_cycle_stats",
+            "crawl_target_urls",
+            "crawl_jobs",
+            "marketing_messages",
+            "campaigns",
+            "leads",
+            "users",
+        ]:
+            cur.execute(f"DELETE FROM {table_name}")
+        conn.commit()
+        conn.close()
+        self._ensure_default_admin_user()
+
     def _ensure_default_admin_user(self):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        row = cur.execute("SELECT 1 FROM users WHERE username = ?", ("admin",)).fetchone()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT 1 FROM users WHERE username = ?"), ("admin",))
+        row = cur.fetchone()
         if row is None:
             password_hash = hashlib.sha256(b"admin123").hexdigest()
-            cur.execute(
-                "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-                ("admin", password_hash, "admin"),
-            )
-            cur.execute(
-                "INSERT INTO activity_log (action, details) VALUES (?, ?)",
-                ("default_admin_created", "Created default admin account"),
-            )
+            cur.execute(self._sql("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)"), ("admin", password_hash, "admin"))
+            cur.execute(self._sql("INSERT INTO activity_log (action, details) VALUES (?, ?)"), ("default_admin_created", "Created default admin account"))
         conn.commit()
         conn.close()
 
     def add_lead(self, name, email, phone, company, source, status, interest, notes):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(
-            """
-            INSERT INTO leads (name, email, phone, company, source, status, interest, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (name, email, phone, company, source, status, interest, notes),
-        )
-        lead_id = cur.lastrowid
+        conn = self._connect()
+        cur = self._cursor(conn)
+        if self.use_postgres:
+            cur.execute(
+                self._sql("""
+                INSERT INTO leads (name, email, phone, company, source, status, interest, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """),
+                (name, email, phone, company, source, status, interest, notes),
+            )
+            row = cur.fetchone()
+            lead_id = row["id"] if row else None
+        else:
+            cur.execute(
+                self._sql("""
+                INSERT INTO leads (name, email, phone, company, source, status, interest, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """),
+                (name, email, phone, company, source, status, interest, notes),
+            )
+            lead_id = cur.lastrowid
         conn.commit()
         conn.close()
         self.log_activity("lead_created", f"Created lead {name}")
         return lead_id
 
     def add_campaign(self, name, channel, budget, target, status):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         cur.execute(
-            """
+            self._sql("""
             INSERT INTO campaigns (name, channel, budget, target, status)
             VALUES (?, ?, ?, ?, ?)
-            """,
+            """),
             (name, channel, budget, target, status),
         )
         conn.commit()
@@ -196,13 +245,13 @@ class DatabaseStore:
         return True
 
     def add_marketing_message(self, channel, content, recipient_count, status="queued"):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         cur.execute(
-            """
+            self._sql("""
             INSERT INTO marketing_messages (channel, content, recipient_count, status)
             VALUES (?, ?, ?, ?)
-            """,
+            """),
             (channel, content, recipient_count, status),
         )
         conn.commit()
@@ -211,11 +260,11 @@ class DatabaseStore:
         return True
 
     def create_user(self, username, password, role):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
         cur.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
+            self._sql("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)") ,
             (username, password_hash, role),
         )
         conn.commit()
@@ -224,13 +273,13 @@ class DatabaseStore:
         return True
 
     def authenticate_user(self, username, password):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        row = cur.execute(
-            "SELECT * FROM users WHERE username = ?",
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(
+            self._sql("SELECT * FROM users WHERE username = ?"),
             (username,),
-        ).fetchone()
+        )
+        row = cur.fetchone()
         conn.close()
         if not row:
             return None
@@ -240,13 +289,21 @@ class DatabaseStore:
         return dict(row)
 
     def add_crawl_job(self, url, title, summary, status="completed"):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO crawl_jobs (url, title, summary, status) VALUES (?, ?, ?, ?)",
-            (url, title, summary, status),
-        )
-        job_id = cur.lastrowid
+        conn = self._connect()
+        cur = self._cursor(conn)
+        if self.use_postgres:
+            cur.execute(
+                self._sql("INSERT INTO crawl_jobs (url, title, summary, status) VALUES (?, ?, ?, ?) RETURNING id"),
+                (url, title, summary, status),
+            )
+            row = cur.fetchone()
+            job_id = row["id"] if row else None
+        else:
+            cur.execute(
+                self._sql("INSERT INTO crawl_jobs (url, title, summary, status) VALUES (?, ?, ?, ?)"),
+                (url, title, summary, status),
+            )
+            job_id = cur.lastrowid
         conn.commit()
         conn.close()
         self.log_activity("crawl_job_created", f"Captured crawl job {url}")
@@ -261,29 +318,29 @@ class DatabaseStore:
         for item in candidate_urls:
             if item and item.strip():
                 normalized_urls.append(item.strip())
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute("DELETE FROM crawl_target_urls")
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("DELETE FROM crawl_target_urls"))
         for item in normalized_urls:
-            cur.execute("INSERT INTO crawl_target_urls (url) VALUES (?)", (item,))
+            cur.execute(self._sql("INSERT INTO crawl_target_urls (url) VALUES (?)"), (item,))
         conn.commit()
         conn.close()
         self.log_activity("crawl_targets_updated", f"Configured {len(normalized_urls)} crawl targets")
         return normalized_urls
 
     def get_crawl_target_urls(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT url FROM crawl_target_urls ORDER BY id ASC").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT url FROM crawl_target_urls ORDER BY id ASC"))
+        rows = cur.fetchall()
         conn.close()
         return [row["url"] for row in rows]
 
     def get_latest_crawl_cycle_summary(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        row = cur.execute("SELECT processed, failed, created_at FROM crawl_cycle_stats ORDER BY id DESC LIMIT 1").fetchone()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT processed, failed, created_at FROM crawl_cycle_stats ORDER BY id DESC LIMIT 1"))
+        row = cur.fetchone()
         conn.close()
         if not row:
             return {"processed": 0, "failed": 0, "total": 0, "created_at": None}
@@ -310,23 +367,23 @@ class DatabaseStore:
         return f"{scheme}://{netloc}{path}"
 
     def add_company_profile(self, url, profile_data):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         normalized_url = self._normalize_profile_url(url) or self._normalize_profile_url(profile_data.get("url"))
         if normalized_url:
-            existing_row = cur.execute(
-                "SELECT id FROM company_profiles WHERE lower(url) = lower(?)",
+            cur.execute(
+                self._sql("SELECT id FROM company_profiles WHERE lower(url) = lower(?)"),
                 (normalized_url,),
-            ).fetchone()
+            )
+            existing_row = cur.fetchone()
             if existing_row:
                 profile_id = existing_row["id"]
                 cur.execute(
-                    """
+                    self._sql("""
                     UPDATE company_profiles
                     SET url = ?, company_name = ?, contact_name = ?, phone = ?, email = ?, address = ?, industry = ?, region = ?, raw_text = ?, status = ?
                     WHERE id = ?
-                    """,
+                    """),
                     (
                         normalized_url,
                         profile_data.get("company_name"),
@@ -346,35 +403,58 @@ class DatabaseStore:
                 self.log_activity("company_profile_updated", f"Updated company profile for {normalized_url}")
                 return profile_id
 
-        cur.execute(
-            """
-            INSERT INTO company_profiles (
-                url, company_name, contact_name, phone, email, address, industry, region, raw_text, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                normalized_url or url,
-                profile_data.get("company_name"),
-                profile_data.get("contact_name"),
-                profile_data.get("phone"),
-                profile_data.get("email"),
-                profile_data.get("address"),
-                profile_data.get("industry"),
-                profile_data.get("region"),
-                profile_data.get("raw_text"),
-                "new",
-            ),
-        )
-        profile_id = cur.lastrowid
+        if self.use_postgres:
+            cur.execute(
+                self._sql("""
+                INSERT INTO company_profiles (
+                    url, company_name, contact_name, phone, email, address, industry, region, raw_text, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                RETURNING id
+                """),
+                (
+                    normalized_url or url,
+                    profile_data.get("company_name"),
+                    profile_data.get("contact_name"),
+                    profile_data.get("phone"),
+                    profile_data.get("email"),
+                    profile_data.get("address"),
+                    profile_data.get("industry"),
+                    profile_data.get("region"),
+                    profile_data.get("raw_text"),
+                    "new",
+                ),
+            )
+            row = cur.fetchone()
+            profile_id = row["id"] if row else None
+        else:
+            cur.execute(
+                self._sql("""
+                INSERT INTO company_profiles (
+                    url, company_name, contact_name, phone, email, address, industry, region, raw_text, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """),
+                (
+                    normalized_url or url,
+                    profile_data.get("company_name"),
+                    profile_data.get("contact_name"),
+                    profile_data.get("phone"),
+                    profile_data.get("email"),
+                    profile_data.get("address"),
+                    profile_data.get("industry"),
+                    profile_data.get("region"),
+                    profile_data.get("raw_text"),
+                    "new",
+                ),
+            )
+            profile_id = cur.lastrowid
         conn.commit()
         conn.close()
         self.log_activity("company_profile_created", f"Captured company profile for {normalized_url or url}")
         return profile_id
 
     def list_company_profiles(self, company_name=None, industry=None, region=None, status=None):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         query = "SELECT * FROM company_profiles WHERE 1=1"
         params = []
         if company_name:
@@ -390,27 +470,28 @@ class DatabaseStore:
             query += " AND status = ?"
             params.append(status)
         query += " ORDER BY created_at DESC"
-        rows = cur.execute(query, params).fetchall()
+        cur.execute(self._sql(query), params)
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def get_company_profile(self, profile_id):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        row = cur.execute("SELECT * FROM company_profiles WHERE id = ?", (profile_id,)).fetchone()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM company_profiles WHERE id = ?"), (profile_id,))
+        row = cur.fetchone()
         conn.close()
         return dict(row) if row else None
 
     def update_company_profile(self, profile_id, profile_data):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         cur.execute(
-            """
+            self._sql("""
             UPDATE company_profiles
             SET company_name = ?, contact_name = ?, phone = ?, email = ?, address = ?, industry = ?, region = ?, url = ?, status = ?
             WHERE id = ?
-            """,
+            """),
             (
                 profile_data.get("company_name"),
                 profile_data.get("contact_name"),
@@ -430,74 +511,80 @@ class DatabaseStore:
         return True
 
     def log_activity(self, action, details):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
+        conn = self._connect()
+        cur = self._cursor(conn)
         cur.execute(
-            "INSERT INTO activity_log (action, details) VALUES (?, ?)",
+            self._sql("INSERT INTO activity_log (action, details) VALUES (?, ?)"),
             (action, details),
         )
         conn.commit()
         conn.close()
 
     def list_leads(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM leads ORDER BY created_at DESC").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM leads ORDER BY created_at DESC"))
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def list_campaigns(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM campaigns ORDER BY created_at DESC").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM campaigns ORDER BY created_at DESC"))
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def list_marketing_messages(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM marketing_messages ORDER BY created_at DESC").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM marketing_messages ORDER BY created_at DESC"))
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def list_crawl_jobs(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM crawl_jobs ORDER BY created_at DESC").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM crawl_jobs ORDER BY created_at DESC"))
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def list_users(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM users ORDER BY created_at DESC").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM users ORDER BY created_at DESC"))
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def get_activity_log(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        rows = cur.execute("SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 50").fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM activity_log ORDER BY created_at DESC LIMIT 50"))
+        rows = cur.fetchall()
         conn.close()
         return [dict(row) for row in rows]
 
     def get_dashboard_summary(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        lead_count = cur.execute("SELECT COUNT(*) AS count FROM leads").fetchone()["count"]
-        campaign_count = cur.execute("SELECT COUNT(*) AS count FROM campaigns").fetchone()["count"]
-        total_budget = cur.execute("SELECT COALESCE(SUM(budget), 0) AS total FROM campaigns").fetchone()["total"]
-        recent_activity = cur.execute("SELECT COUNT(*) AS count FROM activity_log").fetchone()["count"]
-        message_count = cur.execute("SELECT COUNT(*) AS count FROM marketing_messages").fetchone()["count"]
-        user_count = cur.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
-        crawl_count = cur.execute("SELECT COUNT(*) AS count FROM crawl_jobs").fetchone()["count"]
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM leads"))
+        lead_count = cur.fetchone()["count"]
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM campaigns"))
+        campaign_count = cur.fetchone()["count"]
+        cur.execute(self._sql("SELECT COALESCE(SUM(budget), 0) AS total FROM campaigns"))
+        total_budget = cur.fetchone()["total"]
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM activity_log"))
+        recent_activity = cur.fetchone()["count"]
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM marketing_messages"))
+        message_count = cur.fetchone()["count"]
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM users"))
+        user_count = cur.fetchone()["count"]
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM crawl_jobs"))
+        crawl_count = cur.fetchone()["count"]
         conn.close()
         return {
             "lead_count": lead_count,
@@ -510,18 +597,20 @@ class DatabaseStore:
         }
 
     def get_dashboard_chart_data(self):
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        lead_status_rows = cur.execute(
-            "SELECT status, COUNT(*) AS count FROM leads GROUP BY status"
-        ).fetchall()
-        campaign_channel_rows = cur.execute(
-            "SELECT channel, COUNT(*) AS count FROM campaigns GROUP BY channel"
-        ).fetchall()
-        message_status_rows = cur.execute(
-            "SELECT status, COUNT(*) AS count FROM marketing_messages GROUP BY status"
-        ).fetchall()
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(
+            self._sql("SELECT status, COUNT(*) AS count FROM leads GROUP BY status")
+        )
+        lead_status_rows = cur.fetchall()
+        cur.execute(
+            self._sql("SELECT channel, COUNT(*) AS count FROM campaigns GROUP BY channel")
+        )
+        campaign_channel_rows = cur.fetchall()
+        cur.execute(
+            self._sql("SELECT status, COUNT(*) AS count FROM marketing_messages GROUP BY status")
+        )
+        message_status_rows = cur.fetchall()
         conn.close()
         return {
             "lead_status_breakdown": {row["status"] or "unknown": row["count"] for row in lead_status_rows},
@@ -867,6 +956,7 @@ def run_crawl_pipeline(url, preferred_engine="auto"):
 
 
 def crawl_urls_once(store, urls, preferred_engine="auto"):
+    store.init_db()
     processed = 0
     failed = 0
     for url in urls:
@@ -887,10 +977,10 @@ def crawl_urls_once(store, urls, preferred_engine="auto"):
 
 
 def record_crawl_cycle_summary(store, processed, failed):
-    conn = sqlite3.connect(store.db_path)
-    cur = conn.cursor()
+    conn = store._connect()
+    cur = store._cursor(conn)
     cur.execute(
-        "INSERT INTO crawl_cycle_stats (processed, failed) VALUES (?, ?)",
+        store._sql("INSERT INTO crawl_cycle_stats (processed, failed) VALUES (?, ?)"),
         (processed, failed),
     )
     conn.commit()
@@ -901,16 +991,16 @@ def record_crawl_cycle_summary(store, processed, failed):
 def start_background_crawler(store, urls=None, interval_seconds=30, stop_event=None):
     if stop_event is None:
         stop_event = threading.Event()
-    if urls is None:
-        target_urls = store.get_crawl_target_urls()
-    else:
-        target_urls = [item.strip() for item in (urls or []) if item and item.strip()]
-    if not target_urls:
-        target_urls = ["https://example.com"]
 
     def _runner():
         while not stop_event.is_set():
             try:
+                target_urls = store.get_crawl_target_urls()
+                if not target_urls:
+                    fallback_urls = [item.strip() for item in (urls or []) if item and item.strip()]
+                    if not fallback_urls:
+                        fallback_urls = ["https://example.com"]
+                    target_urls = fallback_urls
                 summary = crawl_urls_once(store, target_urls, preferred_engine="standard")
                 store.log_activity(
                     "crawl_loop_tick",
@@ -926,7 +1016,9 @@ def start_background_crawler(store, urls=None, interval_seconds=30, stop_event=N
 
 
 def main():
-    store = DatabaseStore("data.db")
+    if not os.environ.get("CRM_POSTGRES_DSN"):
+        raise RuntimeError("CRM_POSTGRES_DSN must be set to a PostgreSQL connection string")
+    store = DatabaseStore(None)
     store.init_db()
     print("CRM starter initialized")
 

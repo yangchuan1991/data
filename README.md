@@ -11,11 +11,10 @@
 ## 技术栈
 
 - Python 3.11+
-- SQLite
+- PostgreSQL 16+
 - Scrapy
 - FastAPI / Uvicorn
 - Celery / Redis
-- PostgreSQL 兼容适配
 - 标准库 HTTP Server
 
 ## 项目结构
@@ -38,24 +37,42 @@
 2. 安装依赖
    - pip install -r requirements.txt
 
-3. 运行原有 Web 应用
-   - python3 server.py
+3. 配置 PostgreSQL 环境变量
+   - export CRM_POSTGRES_DSN='postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local'
+   - export PORT=8000
 
-4. 浏览器访问
+4. 清理旧数据并重新初始化
+   - psql "postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local" -c "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
+   - CRM_POSTGRES_DSN='postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local' PORT=8000 .venv/bin/python -c "from app import DatabaseStore; DatabaseStore().init_db()"
+
+5. 运行原有 Web 应用
+   - CRM_POSTGRES_DSN='postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local' PORT=8000 .venv/bin/python server.py
+
+5. 浏览器访问
    - http://127.0.0.1:8000/
 
-5. 运行 FastAPI 服务
-   - python -m uvicorn api:app --host 0.0.0.0 --port 8000
+6. 运行 FastAPI 服务
+   - CRM_POSTGRES_DSN='postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local' PORT=8000 .venv/bin/python -m uvicorn api:app --host 0.0.0.0 --port 8000
 
-6. 运行 Scrapy 爬虫
+7. 运行 Scrapy 爬虫
    - cd scrapy_project
-   - scrapy crawl company_spider -a urls="https://example.com,https://www.baidu.com" -s CRAWLER_DB_PATH=../data.db
+   - scrapy crawl company_spider -a urls="https://example.com,https://www.baidu.com"
 
-7. 启动 Celery worker
+8. 启动 Celery worker
    - CELERY_BROKER_URL=redis://localhost:6379/0 CELERY_RESULT_BACKEND=redis://localhost:6379/0 celery -A celery_app worker --loglevel=info
 
-8. 使用 Docker Compose
+9. 使用 Docker Compose
    - docker compose up --build
+
+## 服务器部署
+
+请参考 [deploy/README.md](deploy/README.md) 中的完整步骤。核心要点如下：
+
+- 使用 PostgreSQL 作为主数据库
+- 通过 systemd 管理服务进程
+- 使用 Nginx 反向代理到本地 8000 端口
+- 将 CRM_POSTGRES_DSN 和 PORT 配置为系统环境变量
+- 服务启动前必须保证 PostgreSQL 实例可达，且数据库用户具备建表与写入权限
 
 ## 当前已实现功能
 

@@ -9,15 +9,18 @@ from api import create_app
 
 class EnterpriseApiTests(unittest.TestCase):
     def setUp(self):
-        fd, path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
-        self.db_path = path
-        os.environ["CRM_DB_PATH"] = self.db_path
+        os.environ["CRM_POSTGRES_DSN"] = "postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local"
+        self.db_path = None
+        os.environ.pop("CRM_DB_PATH", None)
+        from app import DatabaseStore
+
+        store = DatabaseStore(None)
+        store.init_db()
+        store.reset_db()
 
     def tearDown(self):
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
         os.environ.pop("CRM_DB_PATH", None)
+        os.environ.pop("CRM_POSTGRES_DSN", None)
 
     def test_health_and_metrics_endpoints(self):
         app = create_app(db_path=self.db_path)

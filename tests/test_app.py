@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 
 from app import (
@@ -10,19 +11,18 @@ from app import (
     record_crawl_cycle_summary,
     run_crawl_pipeline,
 )
+from api import _ensure_background_crawler_running
 
 
 class AppLogicTests(unittest.TestCase):
     def setUp(self):
-        fd, path = tempfile.mkstemp(suffix=".db")
-        os.close(fd)
-        self.db_path = path
-        self.store = DatabaseStore(self.db_path)
+        os.environ["CRM_POSTGRES_DSN"] = "postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local"
+        self.store = DatabaseStore(None)
         self.store.init_db()
+        self.store.reset_db()
 
     def tearDown(self):
-        if os.path.exists(self.db_path):
-            os.remove(self.db_path)
+        os.environ.pop("CRM_POSTGRES_DSN", None)
 
     def test_init_db_and_create_lead(self):
         lead_id = self.store.add_lead(
@@ -251,6 +251,41 @@ class AppLogicTests(unittest.TestCase):
     def test_crawl_targets_can_be_saved_and_loaded(self):
         self.store.save_crawl_targets(["https://example.com", "https://baidu.com"])
         self.assertEqual(["https://example.com", "https://baidu.com"], self.store.get_crawl_target_urls())
+
+    def test_database_store_uses_postgres_when_dsn_is_configured(self):
+        os.environ["CRM_POSTGRES_DSN"] = "postgresql://yangchuan:postgres@127.0.0.1:5432/crm_local"
+        try:
+            store = DatabaseStore("ignored.db")
+            store.init_db()
+            job_id = store.add_crawl_job("https://example.com", "Example", "ok")
+            jobs = store.list_crawl_jobs()
+            self.assertIsNotNone(job_id)
+            self.assertGreaterEqual(len(jobs), 1)
+            if jobs:
+                self.assertEqual("https://example.com", jobs[0]["url"])
+        finally:
+            os.environ.pop("CRM_POSTGRES_DSN", None)
+
+    def test_background_crawler_loop_records_activity(self):
+        self.store.save_crawl_targets(["https://example.com"])
+        thread, stop_event = _ensure_background_crawler_running(
+            self.store,
+            urls=["https://example.com"],
+            interval_seconds=0.1,
+            auto_start=True,
+        )
+        deadline = time.time() + 5
+        activity = self.store.get_activity_log()
+        while time.time() < deadline:
+            activity = self.store.get_activity_log()
+            if any(item["action"] == "crawl_loop_tick" for item in activity):
+                break
+            time.sleep(0.1)
+        if thread is not None:
+            self.assertTrue(thread.is_alive())
+            stop_event.set()
+            thread.join(timeout=5)
+            self.assertFalse(thread.is_alive())
 
     def test_record_crawl_cycle_summary_writes_visible_stats(self):
         record_crawl_cycle_summary(self.store, 3, 1)

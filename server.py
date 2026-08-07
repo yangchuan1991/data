@@ -12,8 +12,10 @@ sys.dont_write_bytecode = True
 
 from app import DatabaseStore, crawl_urls_once, normalize_urls, start_background_crawler
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "data.db")
-store = DatabaseStore(DB_PATH)
+if not os.environ.get("CRM_POSTGRES_DSN"):
+    raise RuntimeError("CRM_POSTGRES_DSN must be set to a PostgreSQL connection string")
+
+store = DatabaseStore(None)
 store.init_db()
 BACKGROUND_CRAWLER_URLS = []
 BACKGROUND_CRAWLER_STOP = None
