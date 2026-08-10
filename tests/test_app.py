@@ -12,6 +12,7 @@ from app import (
     run_crawl_pipeline,
 )
 from api import _ensure_background_crawler_running
+import server
 
 
 class AppLogicTests(unittest.TestCase):
@@ -68,6 +69,28 @@ class AppLogicTests(unittest.TestCase):
         self.assertEqual("Acme Growth", result["title"])
         self.assertIn("grow faster", result["summary"])
         self.assertEqual(["https://example.com/contact"], result["links"])
+
+    def test_company_profile_storage_only_keeps_relevant_fields(self):
+        html = """
+        <html>
+          <head><title>北京XX科技有限公司</title></head>
+          <body>
+            <h1>北京XX科技有限公司</h1>
+            <p>联系人：张先生</p>
+            <p>电话：13800000000</p>
+            <p>邮箱：zhang@example.com</p>
+            <p>办公地址：北京市朝阳区望京SOHO</p>
+            <p>行业：软件研发</p>
+            <p>备注：这段额外说明不应该被保存</p>
+          </body>
+        </html>
+        """
+        result = parse_html_content(html, "https://example.com")
+        profile_id = self.store.add_company_profile("https://example.com", result)
+        profiles = self.store.list_company_profiles()
+        self.assertEqual(1, len(profiles))
+        self.assertEqual("北京XX科技有限公司", profiles[0]["company_name"])
+        self.assertIsNone(profiles[0]["raw_text"])
 
     def test_dashboard_chart_and_marketing_user_features(self):
         self.store.add_lead(name="Bob", email="bob@example.com", phone="", company="", source="web", status="new", interest="", notes="")
@@ -286,6 +309,17 @@ class AppLogicTests(unittest.TestCase):
             stop_event.set()
             thread.join(timeout=5)
             self.assertFalse(thread.is_alive())
+
+    def test_server_toggle_background_crawler_stops_and_starts_loop(self):
+        server.stop_background_crawler()
+        server._ensure_background_crawler_running()
+        self.assertIsNotNone(server.BACKGROUND_CRAWLER_THREAD)
+        self.assertTrue(server.BACKGROUND_CRAWLER_THREAD.is_alive())
+        server.stop_background_crawler()
+        self.assertIsNone(server.BACKGROUND_CRAWLER_THREAD)
+        self.assertIsNone(server.BACKGROUND_CRAWLER_STOP)
+        server._ensure_background_crawler_running()
+        self.assertTrue(server.is_background_crawler_running())
 
     def test_record_crawl_cycle_summary_writes_visible_stats(self):
         record_crawl_cycle_summary(self.store, 3, 1)

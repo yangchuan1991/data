@@ -366,10 +366,26 @@ class DatabaseStore:
         path = parsed.path.rstrip("/") or "/"
         return f"{scheme}://{netloc}{path}"
 
+    def _build_company_profile_payload(self, profile_data, status):
+        return {
+            "url": self._normalize_profile_url(profile_data.get("url")) or self._normalize_profile_url(profile_data.get("page_url")),
+            "company_name": profile_data.get("company_name"),
+            "contact_name": profile_data.get("contact_name"),
+            "phone": profile_data.get("phone"),
+            "email": profile_data.get("email"),
+            "address": profile_data.get("address"),
+            "industry": profile_data.get("industry"),
+            "region": profile_data.get("region"),
+            "raw_text": None,
+            "status": status,
+        }
+
     def add_company_profile(self, url, profile_data):
         conn = self._connect()
         cur = self._cursor(conn)
         normalized_url = self._normalize_profile_url(url) or self._normalize_profile_url(profile_data.get("url"))
+        payload = self._build_company_profile_payload(profile_data, "updated" if normalized_url else "new")
+        payload["url"] = normalized_url or url
         if normalized_url:
             cur.execute(
                 self._sql("SELECT id FROM company_profiles WHERE lower(url) = lower(?)"),
@@ -385,22 +401,22 @@ class DatabaseStore:
                     WHERE id = ?
                     """),
                     (
-                        normalized_url,
-                        profile_data.get("company_name"),
-                        profile_data.get("contact_name"),
-                        profile_data.get("phone"),
-                        profile_data.get("email"),
-                        profile_data.get("address"),
-                        profile_data.get("industry"),
-                        profile_data.get("region"),
-                        profile_data.get("raw_text"),
-                        "updated",
+                        payload["url"],
+                        payload["company_name"],
+                        payload["contact_name"],
+                        payload["phone"],
+                        payload["email"],
+                        payload["address"],
+                        payload["industry"],
+                        payload["region"],
+                        payload["raw_text"],
+                        payload["status"],
                         profile_id,
                     ),
                 )
                 conn.commit()
                 conn.close()
-                self.log_activity("company_profile_updated", f"Updated company profile for {normalized_url}")
+                self.log_activity("company_profile_updated", f"Updated company profile for {payload['url']}")
                 return profile_id
 
         if self.use_postgres:
@@ -412,16 +428,16 @@ class DatabaseStore:
                 RETURNING id
                 """),
                 (
-                    normalized_url or url,
-                    profile_data.get("company_name"),
-                    profile_data.get("contact_name"),
-                    profile_data.get("phone"),
-                    profile_data.get("email"),
-                    profile_data.get("address"),
-                    profile_data.get("industry"),
-                    profile_data.get("region"),
-                    profile_data.get("raw_text"),
-                    "new",
+                    payload["url"],
+                    payload["company_name"],
+                    payload["contact_name"],
+                    payload["phone"],
+                    payload["email"],
+                    payload["address"],
+                    payload["industry"],
+                    payload["region"],
+                    payload["raw_text"],
+                    payload["status"],
                 ),
             )
             row = cur.fetchone()
@@ -434,22 +450,22 @@ class DatabaseStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """),
                 (
-                    normalized_url or url,
-                    profile_data.get("company_name"),
-                    profile_data.get("contact_name"),
-                    profile_data.get("phone"),
-                    profile_data.get("email"),
-                    profile_data.get("address"),
-                    profile_data.get("industry"),
-                    profile_data.get("region"),
-                    profile_data.get("raw_text"),
-                    "new",
+                    payload["url"],
+                    payload["company_name"],
+                    payload["contact_name"],
+                    payload["phone"],
+                    payload["email"],
+                    payload["address"],
+                    payload["industry"],
+                    payload["region"],
+                    payload["raw_text"],
+                    payload["status"],
                 ),
             )
             profile_id = cur.lastrowid
         conn.commit()
         conn.close()
-        self.log_activity("company_profile_created", f"Captured company profile for {normalized_url or url}")
+        self.log_activity("company_profile_created", f"Captured company profile for {payload['url']}")
         return profile_id
 
     def list_company_profiles(self, company_name=None, industry=None, region=None, status=None):

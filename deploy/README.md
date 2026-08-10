@@ -44,14 +44,15 @@ pip install -r requirements.txt
 ### 4.2 配置环境变量
 ```bash
 export CRM_POSTGRES_DSN='postgresql://crm_app:your-strong-password@127.0.0.1:5432/crm_prod'
-export PORT=8000
+export PORT=6000
+export HOST=0.0.0.0
 ```
 
 可将其写入系统环境文件，例如：
 ```bash
 sudo tee /etc/environment.d/crm.conf >/dev/null <<'EOF'
 CRM_POSTGRES_DSN=postgresql://crm_app:your-strong-password@127.0.0.1:5432/crm_prod
-PORT=8000
+PORT=6000
 EOF
 ```
 
@@ -59,7 +60,7 @@ EOF
 
 ### 5.1 启动 Web 服务
 ```bash
-CRM_POSTGRES_DSN='postgresql://crm_app:your-strong-password@127.0.0.1:5432/crm_prod' PORT=8000 /opt/crm_project/.venv/bin/python /opt/crm_project/server.py
+CRM_POSTGRES_DSN='postgresql://crm_app:your-strong-password@127.0.0.1:5432/crm_prod' HOST=0.0.0.0 PORT=6000 /opt/crm_project/.venv/bin/python /opt/crm_project/server.py
 ```
 
 ### 5.2 以 systemd 管理
@@ -82,7 +83,26 @@ sudo systemctl reload nginx
 - server.py 会在启动时初始化数据库结构并启动后台抓取循环。
 - 建议将日志输出到 /var/log/crm/ 下，便于排障。
 
-## 7. 生产环境建议
+## 7. 一键部署脚本
+
+你也可以直接在目标服务器上执行下面的脚本，完成从依赖安装到服务启动的完整流程：
+
+```bash
+scp -r /path/to/this/project user@your-server:/tmp/crm_project
+ssh user@your-server
+sudo cp -r /tmp/crm_project /opt/crm_project
+sudo chmod +x /opt/crm_project/deploy/install_server.sh
+sudo SOURCE_DIR=/opt/crm_project /opt/crm_project/deploy/install_server.sh
+```
+
+脚本默认会：
+- 安装 Python / PostgreSQL / Nginx / Git / curl
+- 创建 `crm_prod` 数据库和 `crm_app` 用户
+- 拉取项目代码并安装依赖
+- 初始化数据库表结构
+- 配置 systemd 服务与 Nginx 反向代理
+
+## 8. 生产环境建议
 - 使用 HTTPS 证书（Let's Encrypt）
 - 配置防火墙允许 80/443 端口
 - 定期备份 PostgreSQL 数据库

@@ -34,6 +34,20 @@ def _ensure_background_crawler_running():
     )
 
 
+def stop_background_crawler():
+    global BACKGROUND_CRAWLER_STOP, BACKGROUND_CRAWLER_THREAD
+    if BACKGROUND_CRAWLER_STOP is not None:
+        BACKGROUND_CRAWLER_STOP.set()
+    if BACKGROUND_CRAWLER_THREAD is not None:
+        BACKGROUND_CRAWLER_THREAD.join(timeout=2)
+    BACKGROUND_CRAWLER_STOP = None
+    BACKGROUND_CRAWLER_THREAD = None
+
+
+def is_background_crawler_running():
+    return BACKGROUND_CRAWLER_THREAD is not None and BACKGROUND_CRAWLER_THREAD.is_alive()
+
+
 _ensure_background_crawler_running()
 
 
@@ -100,6 +114,15 @@ class CRMHandler(BaseHTTPRequestHandler):
 
         if not self._is_authenticated():
             self._redirect("/login")
+            return
+
+        if parsed.path == "/crawler/toggle":
+            self._require_role(["admin", "manager"])
+            if is_background_crawler_running():
+                stop_background_crawler()
+            else:
+                _ensure_background_crawler_running()
+            self._redirect("/")
             return
 
         if parsed.path.startswith("/company/") and parsed.path.endswith("/edit"):
@@ -246,6 +269,8 @@ class CRMHandler(BaseHTTPRequestHandler):
             for item in crawl_status
         )
         configured_targets = "\n".join(store.get_crawl_target_urls())
+        crawler_running = is_background_crawler_running()
+        crawler_button_label = "启动后台抓取" if not crawler_running else "停止后台抓取"
         lead_bars = self._build_bar_chart(chart.get("lead_status_breakdown", {}), "线索状态")
         campaign_bars = self._build_bar_chart(chart.get("campaign_channel_breakdown", {}), "渠道分布")
         message_bars = self._build_bar_chart(chart.get("message_status_breakdown", {}), "营销消息状态")
@@ -394,6 +419,9 @@ class CRMHandler(BaseHTTPRequestHandler):
               <div class="card">
                 <h2>后台抓取状态</h2>
                 <p>最近一轮：成功 {latest_cycle['processed']}，失败 {latest_cycle['failed']}，总计 {latest_cycle['total']}</p>
+                <form method="post" action="/crawler/toggle" style="max-width: 260px; margin-top: 12px;">
+                  <button type="submit">{crawler_button_label}</button>
+                </form>
                 <p>最近 8 条后台抓取事件：</p>
                 <table><thead><tr><th>动作</th><th>详情</th><th>时间</th></tr></thead><tbody>{crawl_status_rows}</tbody></table>
               </div>
@@ -603,14 +631,14 @@ class CRMHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    host = "127.0.0.1"
-    configured_port = os.getenv("PORT", "8000")
+    host = os.getenv("HOST", "0.0.0.0")
+    configured_port = os.getenv("PORT", "6000")
     try:
         preferred_port = int(configured_port)
     except ValueError:
-        preferred_port = 8000
+        preferred_port = 6000
 
-    candidate_ports = [preferred_port, preferred_port + 1, 8000, 8001, 8002]
+    candidate_ports = [preferred_port, preferred_port + 1, 6000, 6001, 8080, 8081, 8000, 8001, 8002]
     server = None
     last_error = None
     for port in candidate_ports:
