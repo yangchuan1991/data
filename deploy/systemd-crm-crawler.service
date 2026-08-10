@@ -4,8 +4,9 @@ After=network.target
 
 [Service]
 WorkingDirectory=/opt/crm_project
+EnvironmentFile=/etc/environment.d/crm.conf
 Environment=PYTHONPATH=/opt/crm_project
-Environment=PORT=6000
+Environment=PORT=8888
 ExecStart=/opt/crm_project/.venv/bin/python /opt/crm_project/server.py
 Restart=always
 User=www-data
