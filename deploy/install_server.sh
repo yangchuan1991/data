@@ -15,27 +15,24 @@ sudo apt update
 sudo apt install -y python3-pip python3-venv nginx postgresql postgresql-contrib git curl
 
 echo "[2/8] Creating PostgreSQL database and user..."
-sudo -u postgres psql <<SQL
-SELECT 'CREATE DATABASE ${DB_NAME}'
-WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
-DO \$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') THEN
-    CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASSWORD}';
-  END IF;
-END
-\$;
-ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';
-ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';
-ALTER ROLE ${DB_USER} SET timezone TO 'UTC';
-GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
-ALTER SCHEMA public OWNER TO ${DB_USER};
-GRANT ALL ON SCHEMA public TO ${DB_USER};
-GRANT ALL ON ALL TABLES IN SCHEMA public TO ${DB_USER};
-GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
-SQL
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname = '${DB_NAME}'" | grep -q 1; then
+  sudo -u postgres createdb "${DB_NAME}"
+fi
+
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" | grep -q 1; then
+  sudo -u postgres psql -c "CREATE ROLE ${DB_USER} WITH LOGIN PASSWORD '${DB_PASSWORD}'"
+fi
+
+sudo -u postgres psql -c "ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';"
+sudo -u postgres psql -c "ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';"
+sudo -u postgres psql -c "ALTER ROLE ${DB_USER} SET timezone TO 'UTC';"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};"
+sudo -u postgres psql -d "${DB_NAME}" -c "ALTER SCHEMA public OWNER TO ${DB_USER};"
+sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_USER};"
+sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO ${DB_USER};"
+sudo -u postgres psql -d "${DB_NAME}" -c "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};"
+sudo -u postgres psql -d "${DB_NAME}" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};"
+sudo -u postgres psql -d "${DB_NAME}" -c "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};"
 
 echo "[3/8] Preparing project directory..."
 sudo mkdir -p "${APP_DIR}"
