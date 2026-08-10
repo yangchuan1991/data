@@ -67,6 +67,7 @@ CRM_POSTGRES_DSN="${POSTGRES_DSN}" \
 ./.venv/bin/python -c "from app import DatabaseStore; DatabaseStore(None).init_db()"
 
 echo "[6/8] Writing environment config..."
+sudo mkdir -p /etc/environment.d
 sudo tee /etc/environment.d/crm.conf >/dev/null <<EOF
 CRM_POSTGRES_DSN=${POSTGRES_DSN}
 HOST=${HOST}
@@ -76,13 +77,15 @@ EOF
 source /etc/environment 2>/dev/null || true
 
 echo "[7/8] Installing systemd service and nginx config..."
+sudo mkdir -p /etc/systemd/system /etc/nginx/conf.d
 sudo cp deploy/systemd-crm-crawler.service /etc/systemd/system/crm-crawler.service
 sudo cp deploy/nginx.conf /etc/nginx/conf.d/crm.conf
+sudo chown -R www-data:www-data "${APP_DIR}" 2>/dev/null || true
 sudo systemctl daemon-reload
-sudo systemctl enable crm-crawler.service
-sudo systemctl restart crm-crawler.service
+sudo systemctl enable crm-crawler.service 2>/dev/null || true
+sudo systemctl restart crm-crawler.service 2>/dev/null || true
 sudo nginx -t
-sudo systemctl reload nginx
+sudo systemctl reload nginx 2>/dev/null || true
 
 echo "[8/8] Deployment complete."
 echo "Open: http://your-server-ip/"
