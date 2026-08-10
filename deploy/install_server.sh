@@ -49,7 +49,8 @@ echo "[4/8] Creating Python virtualenv and installing dependencies..."
 cd "${APP_DIR}"
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --trusted-host pypi.org --trusted-host files.pythonhosted.org -r requirements.txt
 
 echo "[5/8] Initializing database schema..."
 CRM_POSTGRES_DSN="${POSTGRES_DSN}" \
