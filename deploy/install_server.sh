@@ -16,7 +16,8 @@ sudo apt install -y python3-pip python3-venv nginx postgresql postgresql-contrib
 
 echo "[2/8] Creating PostgreSQL database and user..."
 sudo -u postgres psql <<SQL
-CREATE DATABASE ${DB_NAME};
+SELECT 'CREATE DATABASE ${DB_NAME}'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = '${DB_NAME}')\gexec
 DO \$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${DB_USER}') THEN
@@ -28,6 +29,12 @@ ALTER ROLE ${DB_USER} SET client_encoding TO 'utf8';
 ALTER ROLE ${DB_USER} SET default_transaction_isolation TO 'read committed';
 ALTER ROLE ${DB_USER} SET timezone TO 'UTC';
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+ALTER SCHEMA public OWNER TO ${DB_USER};
+GRANT ALL ON SCHEMA public TO ${DB_USER};
+GRANT ALL ON ALL TABLES IN SCHEMA public TO ${DB_USER};
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 SQL
 
 echo "[3/8] Preparing project directory..."
@@ -40,8 +47,14 @@ if [ -d "${SOURCE_DIR}/.git" ]; then
   sudo mkdir -p "${APP_DIR}"
   sudo cp -a "${SOURCE_DIR}/." "${APP_DIR}/"
   sudo chown -R "$USER:$USER" "${APP_DIR}"
+elif [ -d "${SOURCE_DIR}" ]; then
+  echo "Copying project from ${SOURCE_DIR} to ${APP_DIR}..."
+  sudo rm -rf "${APP_DIR}"
+  sudo mkdir -p "${APP_DIR}"
+  sudo cp -a "${SOURCE_DIR}/." "${APP_DIR}/"
+  sudo chown -R "$USER:$USER" "${APP_DIR}"
 else
-  echo "Source directory ${SOURCE_DIR} is not a git repo. Please provide a valid project directory."
+  echo "Source directory ${SOURCE_DIR} does not exist. Please provide a valid project directory."
   exit 1
 fi
 
