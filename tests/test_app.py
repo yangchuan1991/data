@@ -416,9 +416,9 @@ class AppLogicTests(unittest.TestCase):
     def test_crawl_urls_once_persists_results(self):
         summary = crawl_urls_once(self.store, ["https://example.com"], preferred_engine="standard")
         self.assertEqual(1, summary["processed"])
-        jobs = self.store.list_crawl_jobs()
-        self.assertEqual(1, len(jobs))
-        self.assertEqual("https://example.com", jobs[0]["url"])
+        profiles = self.store.list_company_profiles()
+        self.assertGreaterEqual(len(profiles), 1)
+        self.assertEqual("https://example.com/", profiles[0]["url"])
 
     def test_crawl_targets_can_be_saved_and_loaded(self):
         self.store.save_crawl_targets(["https://example.com", "https://baidu.com"])

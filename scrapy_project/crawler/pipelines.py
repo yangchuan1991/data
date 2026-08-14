@@ -16,7 +16,6 @@ class SQLitePipeline:
     def process_item(self, item, spider):
         item_dict = dict(item)
         url = item_dict.get("url") or spider.current_url
-        self.store.add_crawl_job(url, item_dict.get("title", ""), item_dict.get("summary", ""), "completed")
         self.store.add_company_profile(url, item_dict)
         self.store.log_activity("scrapy_crawl_completed", f"Scrapy crawled {url}")
         return item

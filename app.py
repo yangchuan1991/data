@@ -788,6 +788,18 @@ class DatabaseStore:
         )
         conn.commit()
         conn.close()
+
+    def clear_company_profiles(self):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM company_profiles"))
+        row = cur.fetchone()
+        removed = int(row["count"]) if row else 0
+        cur.execute(self._sql("DELETE FROM company_profiles"))
+        conn.commit()
+        conn.close()
+        self.log_activity("company_profiles_cleared", f"Cleared {removed} historical company profiles")
+        return removed
         self.log_activity("company_profile_updated", f"Updated company profile {profile_id}")
         return True
 
@@ -1356,19 +1368,16 @@ def crawl_urls_once(store, urls, preferred_engine="auto", required_region="åŒ—äº
             if is_profile_in_region(result, required_region=required_region):
                 score += 2
             if strict_region and not is_profile_in_region(result, required_region=required_region):
-                store.add_crawl_job(url, result.get("title", ""), f"Filtered out: not in {required_region}", "filtered")
                 store.log_activity("crawl_filtered", f"Skipped non-{required_region} profile: {url}")
                 store.update_target_health(url, "filtered", score=score, error=f"not in {required_region}")
                 filtered += 1
                 continue
-            store.add_crawl_job(url, result.get("title", ""), result.get("summary", ""), "completed")
             store.add_company_profile(url, result)
             store.log_activity("crawl_completed", f"Crawled {url} via {result.get('engine', 'unknown')}")
             store.update_target_health(url, "completed", score=score)
             processed += 1
         except Exception as exc:
             reason = str(exc)
-            store.add_crawl_job(url, "", reason, "failed")
             store.log_activity("crawl_failed", reason)
             store.update_target_health(url, "failed", score=0, error=reason)
             failed += 1

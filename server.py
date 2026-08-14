@@ -257,6 +257,9 @@ class CRMHandler(BaseHTTPRequestHandler):
                 min_score = 4
             result = store.revive_paused_targets(required_region=required_region, min_score=min_score, strict_region=strict_region, limit=30)
             store.log_activity("crawl_revive_paused", f"Revived {result['revived']} targets, rejected {result['rejected']}")
+        elif parsed.path == "/company-profiles/clear-history":
+            self._require_role(["admin", "manager"])
+            store.clear_company_profiles()
         elif parsed.path == "/messages":
             self._require_role(["admin", "manager"])
             store.add_marketing_message(
@@ -291,7 +294,6 @@ class CRMHandler(BaseHTTPRequestHandler):
                 summary = store.get_dashboard_summary()
                 latest_cycle = store.get_latest_crawl_cycle_summary()
                 chart = store.get_dashboard_chart_data()
-                crawl_jobs = store.list_crawl_jobs()
                 activity = store.get_activity_log()
                 users = store.list_users()
                 target_health = store.list_target_health(limit=12)
@@ -310,10 +312,6 @@ class CRMHandler(BaseHTTPRequestHandler):
                 role_label = html.escape(str(user.get("role", "viewer"))) if user else "visitor"
                 export_links = '<a href="/export.csv">导出总览 CSV</a> | <a href="/export.company.csv">导出企业 CSV</a> | <a href="/export.json">导出 JSON</a> | <a href="/logout">退出登录</a>'
 
-                crawl_rows = "".join(
-                        f"<tr><td>{html.escape(str(item['url']))}</td><td>{html.escape(str(item['title']) or '-')}</td><td>{html.escape(str(item['summary']) or '-')}</td><td>{html.escape(str(item['status']))}</td></tr>"
-                        for item in crawl_jobs[:40]
-                )
                 company_rows = "".join(
                         f"<tr><td><a href='/company/{item['id']}'>{html.escape(str(item['company_name'] or ''))}</a></td><td>{html.escape(str(item['contact_name'] or ''))}</td><td>{html.escape(str(item['phone'] or ''))}</td><td>{html.escape(str(item['email'] or ''))}</td><td>{html.escape(str(item['address'] or ''))}</td><td>{html.escape(str(item['industry'] or ''))}</td><td>{html.escape(str(item['region'] or ''))}</td><td>{html.escape(str(item['status'] or ''))}</td></tr>"
                         for item in company_profiles
@@ -370,7 +368,7 @@ class CRMHandler(BaseHTTPRequestHandler):
                                 <div class=\"stat\"><h3>总预算</h3><div>{summary['total_budget']}</div></div>
                                 <div class=\"stat\"><h3>消息数</h3><div>{summary['message_count']}</div></div>
                                 <div class=\"stat\"><h3>用户数</h3><div>{summary['user_count']}</div></div>
-                                <div class=\"stat\"><h3>爬取任务</h3><div>{summary['crawl_count']}</div></div>
+                                   <div class="stat"><h3>企业资料</h3><div>{len(company_profiles)}</div></div>
                             </div>
 
                             <div class=\"card\">
@@ -442,8 +440,10 @@ class CRMHandler(BaseHTTPRequestHandler):
                                 <form method=\"post\" action=\"/crawler/toggle\" style=\"max-width:260px;\"><button type=\"submit\">{crawler_button_label}</button></form>
                             </div>
 
-                            <div class=\"card\"><h2>爬虫任务</h2><table><thead><tr><th>URL</th><th>标题</th><th>摘要/原因</th><th>状态</th></tr></thead><tbody>{crawl_rows}</tbody></table></div>
                             <div class=\"card\"><h2>抓取企业资料</h2>
+                                <form method=\"post\" action=\"/company-profiles/clear-history\" style=\"max-width:320px;margin-bottom:10px;\">
+                                    <button type=\"submit\" onclick=\"return confirm('确认清理全部历史企业资料吗？此操作不可恢复。')\">清理历史企业资料</button>
+                                </form>
                                 <form method=\"get\" action=\"/\"><div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;\">
                                         <input name=\"company_name\" placeholder=\"企业名称\" value=\"{html.escape(company_filters['company_name'])}\" />
                                         <input name=\"industry\" placeholder=\"行业\" value=\"{html.escape(company_filters['industry'])}\" />
