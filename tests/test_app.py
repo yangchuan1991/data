@@ -2,14 +2,20 @@ import os
 import tempfile
 import time
 import unittest
+import app as app_module
 
 from app import (
+    DEFAULT_BEIJING_TARGET_CANDIDATES,
     DatabaseStore,
     crawl_urls_once,
+    dedupe_urls,
+    discover_viable_targets,
+    is_profile_in_region,
     normalize_urls,
     parse_html_content,
     record_crawl_cycle_summary,
     run_crawl_pipeline,
+    should_pause_target,
 )
 from api import _ensure_background_crawler_running
 import server
@@ -219,6 +225,64 @@ class AppLogicTests(unittest.TestCase):
         self.assertEqual("13800000000", result["phone"])
         self.assertEqual("zhang@example.com", result["email"])
 
+    def test_region_is_not_forced_to_beijing_when_missing(self):
+        html = """
+        <html>
+          <head><title>某科技公司</title></head>
+          <body>
+            <h1>某科技公司</h1>
+            <p>联系人：王先生</p>
+            <p>联系电话：13800000000</p>
+          </body>
+        </html>
+        """
+        result = parse_html_content(html, "https://example.com")
+        self.assertIsNone(result["region"])
+
+    def test_is_profile_in_region_matches_beijing_districts(self):
+        profile = {
+            "company_name": "某某科技",
+            "address": "海淀区中关村软件园",
+            "region": None,
+            "raw_text": "",
+        }
+        self.assertTrue(is_profile_in_region(profile, required_region="北京"))
+
+    def test_crawl_urls_once_strict_region_filters_non_beijing(self):
+        original_runner = app_module.run_crawl_pipeline
+
+        def fake_runner(url, preferred_engine="auto"):
+            return {
+                "title": "测试企业",
+                "summary": "测试摘要",
+                "links": [],
+                "company_name": "上海测试企业",
+                "contact_name": "张三",
+                "phone": "13800000000",
+                "email": "z@example.com",
+                "address": "上海市浦东新区",
+                "industry": "软件",
+                "region": "上海",
+                "raw_text": "上海市浦东新区",
+                "engine": "test",
+            }
+
+        try:
+            app_module.run_crawl_pipeline = fake_runner
+            summary = crawl_urls_once(
+                self.store,
+                ["https://example.com"],
+                preferred_engine="standard",
+                required_region="北京",
+                strict_region=True,
+            )
+        finally:
+            app_module.run_crawl_pipeline = original_runner
+
+        self.assertEqual(0, summary["processed"])
+        self.assertEqual(1, summary["filtered"])
+        self.assertEqual(0, len(self.store.list_company_profiles()))
+
     def test_company_profile_parsing_from_jsonld_and_meta_tags(self):
         html = """
         <html>
@@ -258,6 +322,91 @@ class AppLogicTests(unittest.TestCase):
     def test_normalize_urls_supports_multiple_inputs(self):
         urls = normalize_urls("https://example.com\nhttps://baidu.com, https://bing.com")
         self.assertEqual(["https://example.com", "https://baidu.com", "https://bing.com"], urls)
+
+    def test_dedupe_urls_removes_case_and_trailing_slash_duplicates(self):
+        urls = dedupe_urls(["https://example.com", "https://example.com/", "HTTPS://EXAMPLE.COM"])
+        self.assertEqual(["https://example.com"], urls)
+
+    def test_append_crawl_targets_merges_without_overwriting_existing(self):
+        self.store.save_crawl_targets(["https://example.com"])
+        merged = self.store.append_crawl_targets(["https://example.com/", "https://baidu.com"])
+        self.assertEqual(["https://example.com", "https://baidu.com"], merged)
+
+    def test_discover_viable_targets_filters_by_score_and_region(self):
+        original_fetch = app_module.fetch_url_content
+
+        def fake_fetch(url):
+            if "good" in url:
+                return """
+                <html><head><title>北京优质企业</title></head><body>
+                <p>公司名称：北京优质企业有限公司</p>
+                <p>联系电话：13800000000</p>
+                <p>邮箱：hello@good.com</p>
+                <p>地址：北京市海淀区中关村</p>
+                <p>行业：软件服务</p>
+                </body></html>
+                """
+            return """
+            <html><head><title>外地企业</title></head><body>
+            <p>公司名称：上海企业有限公司</p>
+            <p>地址：上海市浦东新区</p>
+            </body></html>
+            """
+
+        try:
+            app_module.fetch_url_content = fake_fetch
+            result = discover_viable_targets(
+                ["https://good.example.com", "https://other.example.com"],
+                required_region="北京",
+                min_score=4,
+                strict_region=True,
+            )
+        finally:
+            app_module.fetch_url_content = original_fetch
+
+        self.assertEqual(2, result["total"])
+        self.assertEqual(1, len(result["viable"]))
+        self.assertIn("good.example.com", result["viable"][0]["url"])
+        self.assertEqual(1, len(result["rejected"]))
+
+    def test_default_candidate_pool_is_not_empty(self):
+        self.assertGreaterEqual(len(DEFAULT_BEIJING_TARGET_CANDIDATES), 5)
+
+    def test_should_pause_target_on_failure_streak(self):
+        paused = should_pause_target(success_count=1, failed_count=3, consecutive_failures=3, min_samples=5, failure_streak_threshold=3, min_success_rate=0.2)
+        self.assertTrue(paused)
+
+    def test_should_not_pause_with_good_success_rate(self):
+        paused = should_pause_target(success_count=8, failed_count=1, consecutive_failures=0, min_samples=5, failure_streak_threshold=3, min_success_rate=0.2)
+        self.assertFalse(paused)
+
+    def test_revive_paused_targets_restores_viable_urls(self):
+        original_discover = app_module.discover_viable_targets
+
+        def fake_discover(urls, required_region="北京", min_score=4, strict_region=True):
+            return {
+                "total": len(urls),
+                "viable": [{"url": urls[0], "score": 6}] if urls else [],
+                "rejected": [{"url": urls[1], "score": 1, "reason": "low score"}] if len(urls) > 1 else [],
+            }
+
+        self.store.update_target_health("https://paused1.example.com", "failed", score=0, error="x")
+        self.store.update_target_health("https://paused1.example.com", "failed", score=0, error="x")
+        self.store.update_target_health("https://paused1.example.com", "failed", score=0, error="x")
+        self.store.update_target_health("https://paused2.example.com", "failed", score=0, error="x")
+        self.store.update_target_health("https://paused2.example.com", "failed", score=0, error="x")
+        self.store.update_target_health("https://paused2.example.com", "failed", score=0, error="x")
+
+        try:
+            app_module.discover_viable_targets = fake_discover
+            result = self.store.revive_paused_targets(required_region="北京", min_score=4, strict_region=True, limit=10)
+        finally:
+            app_module.discover_viable_targets = original_discover
+
+        self.assertGreaterEqual(result["total"], 1)
+        self.assertEqual(1, result["revived"])
+        targets = self.store.get_crawl_target_urls()
+        self.assertIn("https://paused1.example.com", targets)
 
     def test_run_crawl_pipeline_uses_standard_library_fallback(self):
         result = run_crawl_pipeline("https://example.com", preferred_engine="standard")

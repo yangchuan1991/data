@@ -4,20 +4,45 @@ import threading
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app import DatabaseStore, crawl_urls_once, start_background_crawler
+from app import (
+    DEFAULT_BEIJING_TARGET_CANDIDATES,
+    DatabaseStore,
+    crawl_urls_once,
+    discover_viable_targets,
+    normalize_urls,
+    start_background_crawler,
+)
 
 
 class CrawlRequest(BaseModel):
     urls: List[str]
     engine: str = "standard"
+    required_region: str = "北京"
+    strict_region: bool = True
 
 
 class CrawlResponse(BaseModel):
     status: str
     queued: int
     message: str
+
+
+class DiscoverRequest(BaseModel):
+    candidates: List[str] = Field(default_factory=list)
+    required_region: str = "北京"
+    strict_region: bool = True
+    min_score: int = 4
+    crawl_after_discovery: bool = True
+    engine: str = "standard"
+
+
+class RevivePausedRequest(BaseModel):
+    required_region: str = "北京"
+    strict_region: bool = True
+    min_score: int = 4
+    limit: int = 30
 
 
 class MonitoringService:
@@ -102,9 +127,74 @@ def create_app(db_path: Optional[str] = None) -> FastAPI:
         urls = [item.strip() for item in payload.urls if item and item.strip()]
         store.save_crawl_targets(urls)
         _ensure_background_crawler_running(store, urls=urls, interval_seconds=30)
-        summary = crawl_urls_once(store, urls, preferred_engine=payload.engine)
-        monitoring.add_event("crawl_submitted", f"processed={summary['processed']} failed={summary['failed']}")
+        summary = crawl_urls_once(
+            store,
+            urls,
+            preferred_engine=payload.engine,
+            required_region=payload.required_region,
+            strict_region=payload.strict_region,
+        )
+        monitoring.add_event(
+            "crawl_submitted",
+            f"processed={summary['processed']} filtered={summary['filtered']} failed={summary['failed']}",
+        )
         return CrawlResponse(status="queued", queued=len(urls), message="crawl accepted")
+
+    @app.post("/api/crawl/discover")
+    def discover_targets(payload: DiscoverRequest):
+        candidate_urls = normalize_urls("\n".join(payload.candidates)) if payload.candidates else list(DEFAULT_BEIJING_TARGET_CANDIDATES)
+        result = discover_viable_targets(
+            candidate_urls,
+            required_region=payload.required_region,
+            min_score=max(1, min(10, payload.min_score)),
+            strict_region=payload.strict_region,
+        )
+        for item in result.get("viable", []):
+            store.update_target_health(item["url"], "completed", score=item.get("score", 0))
+        for item in result.get("rejected", []):
+            status = "filtered" if "not in" in str(item.get("reason", "")) else "failed"
+            store.update_target_health(item["url"], status, score=item.get("score", 0), error=item.get("reason"))
+        viable_urls = [item["url"] for item in result.get("viable", [])]
+        crawl_summary = None
+        if viable_urls:
+            store.append_crawl_targets(viable_urls)
+            if payload.crawl_after_discovery:
+                crawl_summary = crawl_urls_once(
+                    store,
+                    viable_urls,
+                    preferred_engine=payload.engine,
+                    required_region=payload.required_region,
+                    strict_region=payload.strict_region,
+                )
+        monitoring.add_event(
+            "crawl_discovery",
+            f"total={result['total']} viable={len(viable_urls)} rejected={len(result['rejected'])}",
+        )
+        return {
+            "status": "ok",
+            "total": result["total"],
+            "viable": result["viable"],
+            "rejected": result["rejected"],
+            "appended": len(viable_urls),
+            "crawl_summary": crawl_summary,
+        }
+
+    @app.post("/api/crawl/prune-paused")
+    def prune_paused_targets():
+        removed = store.prune_paused_targets()
+        monitoring.add_event("crawl_prune_paused", f"removed={len(removed)}")
+        return {"status": "ok", "removed": len(removed), "urls": removed}
+
+    @app.post("/api/crawl/revive-paused")
+    def revive_paused_targets(payload: RevivePausedRequest):
+        result = store.revive_paused_targets(
+            required_region=payload.required_region,
+            min_score=max(1, min(10, payload.min_score)),
+            strict_region=payload.strict_region,
+            limit=max(1, min(200, payload.limit)),
+        )
+        monitoring.add_event("crawl_revive_paused", f"total={result['total']} revived={result['revived']} rejected={result['rejected']}")
+        return {"status": "ok", **result}
 
     return app
 

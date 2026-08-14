@@ -6,14 +6,37 @@ services:
     ports:
       - "8000:8000"
     environment:
-      CRM_DB_PATH: /data/data.db
+      CRM_POSTGRES_DSN: postgresql://crm_app:crm_password@postgres:5432/crm_prod
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
-    volumes:
-      - ./data:/data
     depends_on:
+      - postgres
       - redis
+
+  worker:
+    build: .
+    command: celery -A celery_app worker --loglevel=info
+    environment:
+      CRM_POSTGRES_DSN: postgresql://crm_app:crm_password@postgres:5432/crm_prod
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: crm_prod
+      POSTGRES_USER: crm_app
+      POSTGRES_PASSWORD: crm_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
   redis:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+
+volumes:
+  postgres_data:

@@ -17,6 +17,36 @@ except Exception:  # pragma: no cover
 
 sys.dont_write_bytecode = True
 
+BEIJING_REGION_KEYWORDS = (
+    "北京",
+    "北京市",
+    "东城",
+    "西城",
+    "朝阳",
+    "海淀",
+    "丰台",
+    "石景山",
+    "通州",
+    "昌平",
+    "大兴",
+    "顺义",
+    "房山",
+    "门头沟",
+    "怀柔",
+    "平谷",
+    "密云",
+    "延庆",
+)
+
+DEFAULT_BEIJING_TARGET_CANDIDATES = [
+    "https://beijing.11467.com",
+    "https://www.yellowurl.cn",
+    "https://www.b2b168.com/beijing/",
+    "https://www.zyzhan.com/company/",
+    "https://www.gkzhan.com/company/",
+    "https://www.58.com/bj/",
+]
+
 
 class DatabaseStore:
     def __init__(self, db_path=None):
@@ -139,6 +169,28 @@ class DatabaseStore:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS crawl_target_health (
+                id SERIAL PRIMARY KEY,
+                url TEXT NOT NULL UNIQUE,
+                success_count INTEGER DEFAULT 0,
+                failed_count INTEGER DEFAULT 0,
+                filtered_count INTEGER DEFAULT 0,
+                consecutive_failures INTEGER DEFAULT 0,
+                avg_score REAL DEFAULT 0,
+                is_paused BOOLEAN DEFAULT FALSE,
+                pause_reason TEXT,
+                last_status TEXT,
+                last_error TEXT,
+                last_checked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute("ALTER TABLE crawl_target_health ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE crawl_target_health ADD COLUMN IF NOT EXISTS is_paused BOOLEAN DEFAULT FALSE")
+        cur.execute("ALTER TABLE crawl_target_health ADD COLUMN IF NOT EXISTS pause_reason TEXT")
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS company_profiles (
                 id SERIAL PRIMARY KEY,
                 url TEXT NOT NULL,
@@ -169,6 +221,7 @@ class DatabaseStore:
         conn.commit()
         conn.close()
         self._ensure_default_admin_user()
+        self._ensure_default_crawl_targets()
 
     def reset_db(self):
         conn = self._connect()
@@ -176,6 +229,7 @@ class DatabaseStore:
         for table_name in [
             "activity_log",
             "company_profiles",
+            "crawl_target_health",
             "crawl_cycle_stats",
             "crawl_target_urls",
             "crawl_jobs",
@@ -188,6 +242,7 @@ class DatabaseStore:
         conn.commit()
         conn.close()
         self._ensure_default_admin_user()
+        self._ensure_default_crawl_targets()
 
     def _ensure_default_admin_user(self):
         conn = self._connect()
@@ -198,6 +253,22 @@ class DatabaseStore:
             password_hash = hashlib.sha256(b"admin123").hexdigest()
             cur.execute(self._sql("INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)"), ("admin", password_hash, "admin"))
             cur.execute(self._sql("INSERT INTO activity_log (action, details) VALUES (?, ?)"), ("default_admin_created", "Created default admin account"))
+        conn.commit()
+        conn.close()
+
+    def _ensure_default_crawl_targets(self):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT COUNT(*) AS count FROM crawl_target_urls"))
+        row = cur.fetchone()
+        count = int(row["count"]) if row else 0
+        if count == 0:
+            for url in DEFAULT_BEIJING_TARGET_CANDIDATES:
+                cur.execute(self._sql("INSERT INTO crawl_target_urls (url) VALUES (?) ON CONFLICT (url) DO NOTHING"), (url,))
+            cur.execute(
+                self._sql("INSERT INTO activity_log (action, details) VALUES (?, ?)") ,
+                ("crawl_targets_seeded", f"Seeded {len(DEFAULT_BEIJING_TARGET_CANDIDATES)} default Beijing targets"),
+            )
         conn.commit()
         conn.close()
 
@@ -328,6 +399,13 @@ class DatabaseStore:
         self.log_activity("crawl_targets_updated", f"Configured {len(normalized_urls)} crawl targets")
         return normalized_urls
 
+    def append_crawl_targets(self, urls):
+        existing = self.get_crawl_target_urls()
+        merged = dedupe_urls(existing + list(urls or []))
+        self.save_crawl_targets(merged)
+        self.log_activity("crawl_targets_appended", f"Appended targets, total now {len(merged)}")
+        return merged
+
     def get_crawl_target_urls(self):
         conn = self._connect()
         cur = self._cursor(conn)
@@ -335,6 +413,193 @@ class DatabaseStore:
         rows = cur.fetchall()
         conn.close()
         return [row["url"] for row in rows]
+
+    def get_active_crawl_target_urls(self):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(
+            self._sql(
+                """
+                SELECT t.url
+                FROM crawl_target_urls t
+                LEFT JOIN crawl_target_health h ON lower(h.url) = lower(t.url)
+                WHERE COALESCE(h.is_paused, FALSE) = FALSE
+                ORDER BY t.id ASC
+                """
+            )
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [row["url"] for row in rows]
+
+    def prune_paused_targets(self):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT url FROM crawl_target_health WHERE is_paused = TRUE"))
+        paused_rows = cur.fetchall()
+        paused_urls = [row["url"] for row in paused_rows]
+        if paused_urls:
+            cur.execute(
+                self._sql(
+                    """
+                    DELETE FROM crawl_target_urls
+                    WHERE lower(url) IN (SELECT lower(url) FROM crawl_target_health WHERE is_paused = TRUE)
+                    """
+                )
+            )
+        conn.commit()
+        conn.close()
+        self.log_activity("crawl_targets_pruned", f"Pruned {len(paused_urls)} paused targets")
+        return paused_urls
+
+    def list_paused_target_urls(self, limit=50):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(
+            self._sql(
+                """
+                SELECT url
+                FROM crawl_target_health
+                WHERE is_paused = TRUE
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """
+            ),
+            (max(1, int(limit or 50)),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [row["url"] for row in rows]
+
+    def revive_paused_targets(self, required_region="北京", min_score=4, strict_region=True, limit=20):
+        paused_urls = self.list_paused_target_urls(limit=limit)
+        if not paused_urls:
+            return {"total": 0, "revived": 0, "rejected": 0, "viable": [], "rejected_items": []}
+        discovery = discover_viable_targets(
+            paused_urls,
+            required_region=required_region,
+            min_score=min_score,
+            strict_region=strict_region,
+        )
+        for item in discovery.get("viable", []):
+            self.update_target_health(item["url"], "completed", score=item.get("score", 0))
+        for item in discovery.get("rejected", []):
+            status = "filtered" if "not in" in str(item.get("reason", "")) else "failed"
+            self.update_target_health(item["url"], status, score=item.get("score", 0), error=item.get("reason"))
+
+        revived_urls = [item["url"] for item in discovery.get("viable", [])]
+        if revived_urls:
+            self.append_crawl_targets(revived_urls)
+        self.log_activity(
+            "crawl_targets_revived",
+            f"Revive check total {discovery['total']}, revived {len(revived_urls)}, rejected {len(discovery['rejected'])}",
+        )
+        return {
+            "total": discovery["total"],
+            "revived": len(revived_urls),
+            "rejected": len(discovery["rejected"]),
+            "viable": discovery.get("viable", []),
+            "rejected_items": discovery.get("rejected", []),
+        }
+
+    def update_target_health(self, url, status, score=0, error=None):
+        normalized = self._normalize_profile_url(url) or str(url or "").strip()
+        if not normalized:
+            return
+        status = status or "unknown"
+        failure_streak_threshold = int(os.getenv("CRM_TARGET_FAILURE_STREAK", "3") or 3)
+        min_samples = int(os.getenv("CRM_TARGET_MIN_SAMPLES", "5") or 5)
+        min_success_rate = float(os.getenv("CRM_TARGET_MIN_SUCCESS_RATE", "0.2") or 0.2)
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(self._sql("SELECT * FROM crawl_target_health WHERE lower(url)=lower(?)"), (normalized,))
+        row = cur.fetchone()
+        if row:
+            success_count = int(row.get("success_count") or 0)
+            failed_count = int(row.get("failed_count") or 0)
+            filtered_count = int(row.get("filtered_count") or 0)
+            consecutive_failures = int(row.get("consecutive_failures") or 0)
+            avg_score = float(row.get("avg_score") or 0)
+            is_paused = bool(row.get("is_paused") or False)
+            pause_reason = row.get("pause_reason")
+            total = success_count + failed_count + filtered_count
+            new_total = total + 1
+            new_avg = ((avg_score * total) + float(score or 0)) / new_total if new_total else float(score or 0)
+            if status == "completed":
+                success_count += 1
+                consecutive_failures = 0
+                is_paused = False
+                pause_reason = None
+            elif status == "failed":
+                failed_count += 1
+                consecutive_failures += 1
+            elif status == "filtered":
+                filtered_count += 1
+                consecutive_failures = 0
+
+            if should_pause_target(
+                success_count,
+                failed_count,
+                consecutive_failures,
+                min_samples=min_samples,
+                failure_streak_threshold=failure_streak_threshold,
+                min_success_rate=min_success_rate,
+            ):
+                is_paused = True
+                pause_reason = f"auto-paused: failures={failed_count}, streak={consecutive_failures}"
+            cur.execute(
+                self._sql(
+                    """
+                    UPDATE crawl_target_health
+                    SET success_count=?, failed_count=?, filtered_count=?, consecutive_failures=?, avg_score=?, is_paused=?, pause_reason=?, last_status=?, last_error=?, last_checked_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """
+                ),
+                (success_count, failed_count, filtered_count, consecutive_failures, new_avg, is_paused, pause_reason, status, error, row["id"]),
+            )
+        else:
+            success_count = 1 if status == "completed" else 0
+            failed_count = 1 if status == "failed" else 0
+            filtered_count = 1 if status == "filtered" else 0
+            consecutive_failures = 1 if status == "failed" else 0
+            is_paused = should_pause_target(
+                success_count,
+                failed_count,
+                consecutive_failures,
+                min_samples=min_samples,
+                failure_streak_threshold=failure_streak_threshold,
+                min_success_rate=min_success_rate,
+            )
+            pause_reason = "auto-paused: initial failures" if is_paused else None
+            cur.execute(
+                self._sql(
+                    """
+                    INSERT INTO crawl_target_health (url, success_count, failed_count, filtered_count, consecutive_failures, avg_score, is_paused, pause_reason, last_status, last_error)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """
+                ),
+                (normalized, success_count, failed_count, filtered_count, consecutive_failures, float(score or 0), is_paused, pause_reason, status, error),
+            )
+        conn.commit()
+        conn.close()
+
+    def list_target_health(self, limit=20):
+        conn = self._connect()
+        cur = self._cursor(conn)
+        cur.execute(
+            self._sql(
+                """
+                SELECT url, success_count, failed_count, filtered_count, consecutive_failures, avg_score, is_paused, pause_reason, last_status, last_error, last_checked_at
+                FROM crawl_target_health
+                ORDER BY avg_score DESC, success_count DESC, failed_count ASC, updated_at DESC
+                LIMIT ?
+                """
+            ),
+            (max(1, int(limit or 20)),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
 
     def get_latest_crawl_cycle_summary(self):
         conn = self._connect()
@@ -752,6 +1017,9 @@ def _extract_company_profile(text, title, base_url, html_text=""):
     def _normalize_region(value):
         if not value:
             return None
+        for keyword in BEIJING_REGION_KEYWORDS:
+            if keyword in value:
+                return "北京"
         match = re.search(r"(北京|上海|广州|深圳|天津|重庆|河北|山西|辽宁|吉林|黑龙江|江苏|浙江|安徽|福建|江西|山东|河南|湖北|湖南|广东|海南|四川|贵州|云南|陕西|甘肃|青海|台湾|内蒙古|广西|西藏|宁夏|新疆|香港|澳门)", value)
         return match.group(1) if match else None
 
@@ -864,8 +1132,6 @@ def _extract_company_profile(text, title, base_url, html_text=""):
             region = region_match.group(1)
         elif address:
             region = _normalize_region(address)
-    if region is None:
-        region = "北京"
 
     return {
         "company_name": company_name,
@@ -879,6 +1145,24 @@ def _extract_company_profile(text, title, base_url, html_text=""):
     }
 
 
+def is_profile_in_region(profile_data, required_region="北京"):
+    region = (required_region or "").strip()
+    if not region:
+        return True
+    value_candidates = [
+        profile_data.get("region"),
+        profile_data.get("address"),
+        profile_data.get("company_name"),
+        profile_data.get("raw_text"),
+    ]
+    merged = " ".join([str(item) for item in value_candidates if item]).strip()
+    if not merged:
+        return False
+    if region == "北京":
+        return any(keyword in merged for keyword in BEIJING_REGION_KEYWORDS)
+    return region in merged
+
+
 def normalize_urls(raw_value):
     items = []
     for line in str(raw_value or "").replace("\r", "\n").splitlines():
@@ -890,6 +1174,84 @@ def normalize_urls(raw_value):
                 candidate = f"https://{candidate}"
             items.append(candidate)
     return items
+
+
+def dedupe_urls(urls):
+    deduped = []
+    seen = set()
+    for raw in urls or []:
+        candidate = str(raw or "").strip()
+        if not candidate:
+            continue
+        if not candidate.startswith(("http://", "https://")):
+            candidate = f"https://{candidate}"
+        key = candidate.lower().rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
+
+
+def evaluate_url_viability(url, required_region="北京"):
+    html = fetch_url_content(url)
+    profile = parse_html_content(html, url)
+    score = 0
+    if profile.get("company_name"):
+        score += 2
+    if profile.get("phone"):
+        score += 2
+    if profile.get("email"):
+        score += 2
+    if profile.get("address"):
+        score += 1
+    if profile.get("industry"):
+        score += 1
+    region_matched = is_profile_in_region(profile, required_region=required_region)
+    if region_matched:
+        score += 2
+    return {
+        "url": url,
+        "score": score,
+        "region_matched": region_matched,
+        "company_name": profile.get("company_name"),
+        "region": profile.get("region"),
+        "phone": profile.get("phone"),
+        "email": profile.get("email"),
+    }
+
+
+def discover_viable_targets(candidate_urls, required_region="北京", min_score=4, strict_region=True):
+    urls = dedupe_urls(candidate_urls)
+    viable = []
+    rejected = []
+    for url in urls:
+        try:
+            probe = evaluate_url_viability(url, required_region=required_region)
+            if strict_region and not probe["region_matched"]:
+                rejected.append({"url": url, "reason": f"not in {required_region}", "score": probe.get("score", 0)})
+                continue
+            if probe["score"] < min_score:
+                rejected.append({"url": url, "reason": f"low score {probe['score']} < {min_score}", "score": probe.get("score", 0)})
+                continue
+            viable.append(probe)
+        except Exception as exc:
+            rejected.append({"url": url, "reason": str(exc), "score": 0})
+    return {
+        "viable": viable,
+        "rejected": rejected,
+        "total": len(urls),
+    }
+
+
+def should_pause_target(success_count, failed_count, consecutive_failures, min_samples=5, failure_streak_threshold=3, min_success_rate=0.2):
+    total = int(success_count or 0) + int(failed_count or 0)
+    if int(consecutive_failures or 0) >= int(failure_streak_threshold or 3):
+        return True
+    if total < int(min_samples or 5):
+        return False
+    success_rate = (float(success_count or 0) / float(total)) if total else 0.0
+    return success_rate < float(min_success_rate or 0.2)
 
 
 def parse_html_content(html_text, base_url):
@@ -965,29 +1327,52 @@ def run_crawl_pipeline(url, preferred_engine="auto"):
                 "email": None,
                 "address": None,
                 "industry": None,
-                "region": "北京",
+                "region": None,
                 "raw_text": str(secondary_exc),
                 "engine": "failed",
             }
 
 
-def crawl_urls_once(store, urls, preferred_engine="auto"):
+def crawl_urls_once(store, urls, preferred_engine="auto", required_region="北京", strict_region=False):
     store.init_db()
+    urls = dedupe_urls(urls)
     processed = 0
     failed = 0
+    filtered = 0
     for url in urls:
         try:
             result = run_crawl_pipeline(url, preferred_engine=preferred_engine)
+            score = 0
+            if result.get("company_name"):
+                score += 2
+            if result.get("phone"):
+                score += 2
+            if result.get("email"):
+                score += 2
+            if result.get("address"):
+                score += 1
+            if result.get("industry"):
+                score += 1
+            if is_profile_in_region(result, required_region=required_region):
+                score += 2
+            if strict_region and not is_profile_in_region(result, required_region=required_region):
+                store.add_crawl_job(url, result.get("title", ""), f"Filtered out: not in {required_region}", "filtered")
+                store.log_activity("crawl_filtered", f"Skipped non-{required_region} profile: {url}")
+                store.update_target_health(url, "filtered", score=score, error=f"not in {required_region}")
+                filtered += 1
+                continue
             store.add_crawl_job(url, result.get("title", ""), result.get("summary", ""), "completed")
             store.add_company_profile(url, result)
             store.log_activity("crawl_completed", f"Crawled {url} via {result.get('engine', 'unknown')}")
+            store.update_target_health(url, "completed", score=score)
             processed += 1
         except Exception as exc:
             reason = str(exc)
             store.add_crawl_job(url, "", reason, "failed")
             store.log_activity("crawl_failed", reason)
+            store.update_target_health(url, "failed", score=0, error=reason)
             failed += 1
-    summary = {"processed": processed, "failed": failed, "total": processed + failed}
+    summary = {"processed": processed, "failed": failed, "filtered": filtered, "total": processed + failed + filtered}
     record_crawl_cycle_summary(store, summary["processed"], summary["failed"])
     return summary
 
@@ -1009,18 +1394,28 @@ def start_background_crawler(store, urls=None, interval_seconds=30, stop_event=N
         stop_event = threading.Event()
 
     def _runner():
+        required_region = os.getenv("CRM_CRAWL_REQUIRED_REGION", "北京").strip() or "北京"
+        strict_region = os.getenv("CRM_CRAWL_STRICT_REGION", "1").lower() in {"1", "true", "yes", "on"}
         while not stop_event.is_set():
             try:
-                target_urls = store.get_crawl_target_urls()
+                all_targets = store.get_crawl_target_urls()
+                target_urls = store.get_active_crawl_target_urls()
+                paused_count = max(0, len(all_targets) - len(target_urls))
                 if not target_urls:
                     fallback_urls = [item.strip() for item in (urls or []) if item and item.strip()]
                     if not fallback_urls:
-                        fallback_urls = ["https://example.com"]
+                        fallback_urls = list(DEFAULT_BEIJING_TARGET_CANDIDATES)
                     target_urls = fallback_urls
-                summary = crawl_urls_once(store, target_urls, preferred_engine="standard")
+                summary = crawl_urls_once(
+                    store,
+                    target_urls,
+                    preferred_engine="standard",
+                    required_region=required_region,
+                    strict_region=strict_region,
+                )
                 store.log_activity(
                     "crawl_loop_tick",
-                    f"Background crawl tick processed {summary['processed']} URLs, failed {summary['failed']}",
+                    f"Background crawl tick processed {summary['processed']} URLs, filtered {summary['filtered']}, failed {summary['failed']}, paused_skipped {paused_count}",
                 )
             except Exception as exc:
                 store.log_activity("crawl_loop_error", str(exc))

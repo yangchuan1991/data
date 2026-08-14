@@ -5,6 +5,7 @@ import scrapy
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
+from app import parse_html_content
 from crawler.items import CompanyItem
 
 
@@ -39,33 +40,21 @@ class CompanySpider(scrapy.Spider):
         title = response.css("title::text").get(default="")
         summary = re.sub(r"\s+", " ", text[:500]).strip()
         links = [response.urljoin(link) for link in response.css("a::attr(href)").getall() if link]
+        html_text = response.text
+        profile = parse_html_content(html_text, response.url)
         item = CompanyItem()
         item["url"] = response.url
         item["title"] = (title or "").strip()
         item["summary"] = summary
         item["links"] = links
-        item["company_name"] = self._extract_company_name(response, text)
-        item["contact_name"] = None
-        item["phone"] = self._extract_phone(text)
-        item["email"] = self._extract_email(text)
-        item["address"] = None
-        item["industry"] = None
-        item["region"] = "北京"
+        item["company_name"] = profile.get("company_name") or (title or "").strip()
+        item["contact_name"] = profile.get("contact_name")
+        item["phone"] = profile.get("phone")
+        item["email"] = profile.get("email")
+        item["address"] = profile.get("address")
+        item["industry"] = profile.get("industry")
+        item["region"] = profile.get("region")
         item["raw_text"] = text
         item["engine"] = "scrapy"
         item["status"] = "new"
         yield item
-
-    def _extract_company_name(self, response, text):
-        title = response.css("title::text").get(default="")
-        if title:
-            return title.strip()
-        return text[:120].strip()
-
-    def _extract_phone(self, text):
-        match = re.search(r"(1[3-9]\d{9}|\d{3,4}[-－]?\d{7,8})", text)
-        return match.group(1) if match else None
-
-    def _extract_email(self, text):
-        match = re.search(r"([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})", text)
-        return match.group(1) if match else None

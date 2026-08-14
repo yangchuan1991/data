@@ -10,7 +10,14 @@ from urllib.parse import parse_qs, urlparse
 
 sys.dont_write_bytecode = True
 
-from app import DatabaseStore, crawl_urls_once, normalize_urls, start_background_crawler
+from app import (
+    DEFAULT_BEIJING_TARGET_CANDIDATES,
+    DatabaseStore,
+    crawl_urls_once,
+    discover_viable_targets,
+    normalize_urls,
+    start_background_crawler,
+)
 
 if not os.environ.get("CRM_POSTGRES_DSN"):
     raise RuntimeError("CRM_POSTGRES_DSN must be set to a PostgreSQL connection string")
@@ -174,6 +181,8 @@ class CRMHandler(BaseHTTPRequestHandler):
             self._require_role(["admin", "manager"])
             raw_url = self._get_first(params, "targets", "").strip()
             preferred_engine = self._get_first(params, "engine", "auto")
+            required_region = self._get_first(params, "required_region", "北京").strip() or "北京"
+            strict_region = self._get_first(params, "strict_region", "on") in {"on", "1", "true", "yes"}
             if not raw_url:
                 uploaded_value = self._get_first(params, "urls_file", "")
                 if uploaded_value:
@@ -181,8 +190,73 @@ class CRMHandler(BaseHTTPRequestHandler):
             urls = normalize_urls(raw_url)
             if urls:
                 store.save_crawl_targets(urls)
-                summary = crawl_urls_once(store, urls, preferred_engine=preferred_engine)
-                store.log_activity("crawl_batch_completed", f"Processed {summary['processed']} URLs, failed {summary['failed']}")
+                summary = crawl_urls_once(
+                    store,
+                    urls,
+                    preferred_engine=preferred_engine,
+                    required_region=required_region,
+                    strict_region=strict_region,
+                )
+                store.log_activity(
+                    "crawl_batch_completed",
+                    f"Processed {summary['processed']} URLs, filtered {summary['filtered']}, failed {summary['failed']}",
+                )
+        elif parsed.path == "/crawl/discover":
+            self._require_role(["admin", "manager"])
+            raw_candidates = self._get_first(params, "candidate_targets", "").strip()
+            required_region = self._get_first(params, "required_region", "北京").strip() or "北京"
+            strict_region = self._get_first(params, "strict_region", "on") in {"on", "1", "true", "yes"}
+            crawl_after_discovery = self._get_first(params, "crawl_after_discovery", "on") in {"on", "1", "true", "yes"}
+            preferred_engine = self._get_first(params, "engine", "standard")
+            try:
+                min_score = int(self._get_first(params, "min_score", "4") or 4)
+            except ValueError:
+                min_score = 4
+            candidate_urls = normalize_urls(raw_candidates) if raw_candidates else list(DEFAULT_BEIJING_TARGET_CANDIDATES)
+            discovery = discover_viable_targets(
+                candidate_urls,
+                required_region=required_region,
+                min_score=min_score,
+                strict_region=strict_region,
+            )
+            for item in discovery.get("viable", []):
+                store.update_target_health(item["url"], "completed", score=item.get("score", 0))
+            for item in discovery.get("rejected", []):
+                status = "filtered" if "not in" in str(item.get("reason", "")) else "failed"
+                store.update_target_health(item["url"], status, score=item.get("score", 0), error=item.get("reason"))
+            viable_urls = [item["url"] for item in discovery.get("viable", [])]
+            if viable_urls:
+                store.append_crawl_targets(viable_urls)
+                if crawl_after_discovery:
+                    summary = crawl_urls_once(
+                        store,
+                        viable_urls,
+                        preferred_engine=preferred_engine,
+                        required_region=required_region,
+                        strict_region=strict_region,
+                    )
+                    store.log_activity(
+                        "crawl_discovery_crawled",
+                        f"Discovery crawl processed {summary['processed']}, filtered {summary['filtered']}, failed {summary['failed']}",
+                    )
+            store.log_activity(
+                "crawl_discovery_completed",
+                f"Discovery total {discovery['total']}, viable {len(viable_urls)}, rejected {len(discovery['rejected'])}",
+            )
+        elif parsed.path == "/crawl/prune-paused":
+            self._require_role(["admin", "manager"])
+            removed = store.prune_paused_targets()
+            store.log_activity("crawl_prune_paused", f"Removed {len(removed)} paused targets from target pool")
+        elif parsed.path == "/crawl/revive-paused":
+            self._require_role(["admin", "manager"])
+            required_region = self._get_first(params, "required_region", "北京").strip() or "北京"
+            strict_region = self._get_first(params, "strict_region", "on") in {"on", "1", "true", "yes"}
+            try:
+                min_score = int(self._get_first(params, "min_score", "4") or 4)
+            except ValueError:
+                min_score = 4
+            result = store.revive_paused_targets(required_region=required_region, min_score=min_score, strict_region=strict_region, limit=30)
+            store.log_activity("crawl_revive_paused", f"Revived {result['revived']} targets, rejected {result['rejected']}")
         elif parsed.path == "/messages":
             self._require_role(["admin", "manager"])
             store.add_marketing_message(
@@ -214,253 +288,177 @@ class CRMHandler(BaseHTTPRequestHandler):
         """
 
     def _render_dashboard(self):
-        summary = store.get_dashboard_summary()
-        crawl_status = [
-            item for item in store.get_activity_log()
-            if item.get("action") in {"crawl_completed", "crawl_failed", "crawl_loop_tick", "crawl_loop_error", "crawl_job_created", "crawl_targets_updated"}
-        ][:8]
-        latest_cycle = store.get_latest_crawl_cycle_summary()
-        chart = store.get_dashboard_chart_data()
-        leads = store.list_leads()
-        campaigns = store.list_campaigns()
-        messages = store.list_marketing_messages()
-        crawl_jobs = store.list_crawl_jobs()
-        company_filters = {
-            "company_name": self._get_query_param("company_name"),
-            "industry": self._get_query_param("industry"),
-            "region": self._get_query_param("region"),
-            "status": self._get_query_param("status"),
-        }
-        company_profiles = store.list_company_profiles(**{k: v for k, v in company_filters.items() if v})
-        users = store.list_users()
-        activity = store.get_activity_log()
-        user = self._current_user()
+                summary = store.get_dashboard_summary()
+                latest_cycle = store.get_latest_crawl_cycle_summary()
+                chart = store.get_dashboard_chart_data()
+                crawl_jobs = store.list_crawl_jobs()
+                activity = store.get_activity_log()
+                users = store.list_users()
+                target_health = store.list_target_health(limit=12)
+                user = self._current_user()
 
-        leads_rows = "".join(
-            f"<tr><td>{html.escape(str(item['name']))}</td><td>{html.escape(str(item['company']))}</td><td>{html.escape(str(item['status']))}</td><td>{html.escape(str(item['source']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
-            for item in leads
-        )
-        campaign_rows = "".join(
-            f"<tr><td>{html.escape(str(item['name']))}</td><td>{html.escape(str(item['channel']))}</td><td>{html.escape(str(item['budget']))}</td><td>{html.escape(str(item['status']))}</td></tr>"
-            for item in campaigns
-        )
-        message_rows = "".join(
-            f"<tr><td>{html.escape(str(item['channel']))}</td><td>{html.escape(str(item['content']))}</td><td>{html.escape(str(item['recipient_count']))}</td><td>{html.escape(str(item['status']))}</td></tr>"
-            for item in messages
-        )
-        crawl_rows = "".join(
-            f"<tr><td>{html.escape(str(item['url']))}</td><td>{html.escape(str(item['title']) or '-')}</td><td>{html.escape(str(item['summary']) or '-')}</td><td>{html.escape(str(item['status']))}</td></tr>"
-            for item in crawl_jobs
-        )
-        company_rows = "".join(
-            f"<tr><td><a href='/company/{item['id']}'>{html.escape(str(item['company_name'] or ''))}</a></td><td>{html.escape(str(item['contact_name'] or ''))}</td><td>{html.escape(str(item['phone'] or ''))}</td><td>{html.escape(str(item['email'] or ''))}</td><td>{html.escape(str(item['address'] or ''))}</td><td>{html.escape(str(item['industry'] or ''))}</td><td>{html.escape(str(item['region'] or ''))}</td><td>{html.escape(str(item['status'] or ''))}</td></tr>"
-            for item in company_profiles
-        )
-        user_rows = "".join(
-            f"<tr><td>{html.escape(str(item['username']))}</td><td>{html.escape(str(item['role']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
-            for item in users
-        )
-        activity_rows = "".join(
-            f"<tr><td>{html.escape(str(item['action']))}</td><td>{html.escape(str(item['details']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
-            for item in activity
-        )
-        crawl_status_rows = "".join(
-            f"<tr><td>{html.escape(str(item['action']))}</td><td>{html.escape(str(item['details']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
-            for item in crawl_status
-        )
-        configured_targets = "\n".join(store.get_crawl_target_urls())
-        crawler_running = is_background_crawler_running()
-        crawler_button_label = "启动后台抓取" if not crawler_running else "停止后台抓取"
-        lead_bars = self._build_bar_chart(chart.get("lead_status_breakdown", {}), "线索状态")
-        campaign_bars = self._build_bar_chart(chart.get("campaign_channel_breakdown", {}), "渠道分布")
-        message_bars = self._build_bar_chart(chart.get("message_status_breakdown", {}), "营销消息状态")
-        export_links = '<a href="/export.csv">导出总览 CSV</a> | <a href="/export.company.csv">导出企业 CSV</a> | <a href="/export.json">导出 JSON</a> | <a href="/logout">退出登录</a>'
-        role_label = html.escape(str(user.get("role", "viewer"))) if user else "visitor"
-        return f"""
-        <!doctype html>
-        <html lang=\"zh-CN\">
-          <head>
-            <meta charset=\"utf-8\" />
-            <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-            <title>获客系统控制台</title>
-            <script src=\"https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js\"></script>
-            <style>
-              body {{ font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #223; }}
-              .container {{ max-width: 1400px; margin: 0 auto; padding: 24px; }}
-              .card {{ background: #fff; padding: 18px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); margin-bottom: 16px; }}
-              .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }}
-              .stat {{ background: linear-gradient(135deg, #4f46e5, #2563eb); color: white; padding: 16px; border-radius: 12px; }}
-              form {{ display: grid; gap: 10px; }}
-              input, select, textarea, button {{ padding: 10px; border-radius: 8px; border: 1px solid #ddd; font-size: 14px; }}
-              button {{ background: #2563eb; color: white; cursor: pointer; }}
-              table {{ width: 100%; border-collapse: collapse; }}
-              th, td {{ padding: 10px; border-bottom: 1px solid #eee; text-align: left; }}
-              .bar-chart {{ display: grid; gap: 8px; }}
-              .bar-row {{ display: flex; align-items: center; gap: 10px; }}
-              .bar {{ background: #e2e8f0; border-radius: 999px; height: 10px; flex: 1; overflow: hidden; }}
-              .bar > span {{ display: block; height: 100%; background: linear-gradient(90deg, #4f46e5, #38bdf8); }}
-              #chart {{ width: 100%; height: 320px; }}
-            </style>
-          </head>
-          <body>
-            <div class=\"container\">
-              <h1>获客系统控制台</h1>
-              <p>当前角色：{role_label}。{export_links}</p>
-              <div class=\"grid\">
-                <div class=\"stat\"><h3>线索总数</h3><div>{summary['lead_count']}</div></div>
-                <div class=\"stat\"><h3>营销活动</h3><div>{summary['campaign_count']}</div></div>
-                <div class=\"stat\"><h3>总预算</h3><div>{summary['total_budget']}</div></div>
-                <div class=\"stat\"><h3>消息数</h3><div>{summary['message_count']}</div></div>
-                <div class=\"stat\"><h3>用户数</h3><div>{summary['user_count']}</div></div>
-                <div class=\"stat\"><h3>爬取任务</h3><div>{summary['crawl_count']}</div></div>
-              </div>
+                company_filters = {
+                        "company_name": self._get_query_param("company_name"),
+                        "industry": self._get_query_param("industry"),
+                        "region": self._get_query_param("region") or "北京",
+                        "status": self._get_query_param("status"),
+                }
+                company_profiles = store.list_company_profiles(**{k: v for k, v in company_filters.items() if v})
+                configured_targets = "\n".join(store.get_crawl_target_urls())
+                crawler_running = is_background_crawler_running()
+                crawler_button_label = "启动后台抓取" if not crawler_running else "停止后台抓取"
+                role_label = html.escape(str(user.get("role", "viewer"))) if user else "visitor"
+                export_links = '<a href="/export.csv">导出总览 CSV</a> | <a href="/export.company.csv">导出企业 CSV</a> | <a href="/export.json">导出 JSON</a> | <a href="/logout">退出登录</a>'
 
-              <div class=\"card\">
-                <h2>图表分析（ECharts）</h2>
-                <div id=\"chart\"></div>
-                <script>
-                  const chart = echarts.init(document.getElementById('chart'));
-                  chart.setOption({{
-                    title:{{text:'线索与营销趋势'}},
-                    tooltip:{{trigger:'axis'}},
-                    legend:{{data:['线索','消息','活动']}},
-                    xAxis:{{type:'category', data:['线索','消息','活动']}},
-                    yAxis:{{type:'value'}},
-                    series:[{{name:'线索',type:'bar',data:[{summary['lead_count']}] }},{{name:'消息',type:'bar',data:[{summary['message_count']}] }},{{name:'活动',type:'bar',data:[{summary['campaign_count']}]}}]
-                  }});
-                </script>
-                <div class=\"grid\">
-                  <div>{lead_bars}</div>
-                  <div>{campaign_bars}</div>
-                  <div>{message_bars}</div>
-                </div>
-              </div>
+                crawl_rows = "".join(
+                        f"<tr><td>{html.escape(str(item['url']))}</td><td>{html.escape(str(item['title']) or '-')}</td><td>{html.escape(str(item['summary']) or '-')}</td><td>{html.escape(str(item['status']))}</td></tr>"
+                        for item in crawl_jobs[:40]
+                )
+                company_rows = "".join(
+                        f"<tr><td><a href='/company/{item['id']}'>{html.escape(str(item['company_name'] or ''))}</a></td><td>{html.escape(str(item['contact_name'] or ''))}</td><td>{html.escape(str(item['phone'] or ''))}</td><td>{html.escape(str(item['email'] or ''))}</td><td>{html.escape(str(item['address'] or ''))}</td><td>{html.escape(str(item['industry'] or ''))}</td><td>{html.escape(str(item['region'] or ''))}</td><td>{html.escape(str(item['status'] or ''))}</td></tr>"
+                        for item in company_profiles
+                )
+                activity_rows = "".join(
+                        f"<tr><td>{html.escape(str(item['action']))}</td><td>{html.escape(str(item['details']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
+                        for item in activity
+                )
+                user_rows = "".join(
+                        f"<tr><td>{html.escape(str(item['username']))}</td><td>{html.escape(str(item['role']))}</td><td>{html.escape(str(item['created_at']))}</td></tr>"
+                        for item in users
+                )
+                target_rows = "".join(
+                    f"<tr><td>{html.escape(str(item['url']))}</td><td>{item['success_count']}</td><td>{item['failed_count']}</td><td>{item['consecutive_failures']}</td><td>{item['filtered_count']}</td><td>{round(float(item['avg_score'] or 0), 2)}</td><td>{'yes' if item.get('is_paused') else 'no'}</td><td>{html.escape(str(item.get('pause_reason') or '-'))}</td><td>{html.escape(str(item['last_status'] or '-'))}</td></tr>"
+                        for item in target_health
+                )
+                lead_bars = self._build_bar_chart(chart.get("lead_status_breakdown", {}), "线索状态")
+                campaign_bars = self._build_bar_chart(chart.get("campaign_channel_breakdown", {}), "渠道分布")
+                message_bars = self._build_bar_chart(chart.get("message_status_breakdown", {}), "营销消息状态")
 
-              <div class=\"card\">
-                <h2>新增线索</h2>
-                <form method=\"post\" action=\"/leads\">
-                  <input name=\"name\" placeholder=\"姓名\" required />
-                  <input name=\"email\" placeholder=\"邮箱\" />
-                  <input name=\"phone\" placeholder=\"电话\" />
-                  <input name=\"company\" placeholder=\"公司\" />
-                  <input name=\"source\" placeholder=\"来源\" />
-                  <select name=\"status\">
-                    <option value=\"new\">new</option>
-                    <option value=\"contacted\">contacted</option>
-                    <option value=\"qualified\">qualified</option>
-                  </select>
-                  <input name=\"interest\" placeholder=\"兴趣点\" />
-                  <textarea name=\"notes\" placeholder=\"备注\"></textarea>
-                  <button type=\"submit\">保存线索</button>
-                </form>
-              </div>
+                return f"""
+                <!doctype html>
+                <html lang=\"zh-CN\">
+                    <head>
+                        <meta charset=\"utf-8\" />
+                        <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+                        <title>获客系统控制台</title>
+                        <script src=\"https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js\"></script>
+                        <style>
+                            body {{ font-family: Arial, sans-serif; margin: 0; background: #f5f7fb; color: #223; }}
+                            .container {{ max-width: 1400px; margin: 0 auto; padding: 24px; }}
+                            .card {{ background: #fff; padding: 18px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); margin-bottom: 16px; }}
+                            .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; }}
+                            .stat {{ background: linear-gradient(135deg, #4f46e5, #2563eb); color: white; padding: 16px; border-radius: 12px; }}
+                            form {{ display: grid; gap: 10px; }}
+                            input, select, textarea, button {{ padding: 10px; border-radius: 8px; border: 1px solid #ddd; font-size: 14px; }}
+                            button {{ background: #2563eb; color: white; cursor: pointer; }}
+                            table {{ width: 100%; border-collapse: collapse; }}
+                            th, td {{ padding: 10px; border-bottom: 1px solid #eee; text-align: left; }}
+                            .bar-chart {{ display: grid; gap: 8px; }}
+                            .bar-row {{ display: flex; align-items: center; gap: 10px; }}
+                            .bar {{ background: #e2e8f0; border-radius: 999px; height: 10px; flex: 1; overflow: hidden; }}
+                            .bar > span {{ display: block; height: 100%; background: linear-gradient(90deg, #4f46e5, #38bdf8); }}
+                            #chart {{ width: 100%; height: 320px; }}
+                        </style>
+                    </head>
+                    <body>
+                        <div class=\"container\">
+                            <h1>获客系统控制台</h1>
+                            <p>当前角色：{role_label}。{export_links}</p>
+                            <div class=\"grid\">
+                                <div class=\"stat\"><h3>线索总数</h3><div>{summary['lead_count']}</div></div>
+                                <div class=\"stat\"><h3>营销活动</h3><div>{summary['campaign_count']}</div></div>
+                                <div class=\"stat\"><h3>总预算</h3><div>{summary['total_budget']}</div></div>
+                                <div class=\"stat\"><h3>消息数</h3><div>{summary['message_count']}</div></div>
+                                <div class=\"stat\"><h3>用户数</h3><div>{summary['user_count']}</div></div>
+                                <div class=\"stat\"><h3>爬取任务</h3><div>{summary['crawl_count']}</div></div>
+                            </div>
 
-              <div class=\"card\">
-                <h2>新增营销活动</h2>
-                <form method=\"post\" action=\"/campaigns\">
-                  <input name=\"name\" placeholder=\"活动名称\" required />
-                  <input name=\"channel\" placeholder=\"渠道\" />
-                  <input name=\"budget\" type=\"number\" step=\"0.01\" placeholder=\"预算\" />
-                  <input name=\"target\" placeholder=\"目标客户\" />
-                  <select name=\"status\">
-                    <option value=\"running\">running</option>
-                    <option value=\"paused\">paused</option>
-                    <option value=\"completed\">completed</option>
-                  </select>
-                  <button type=\"submit\">创建活动</button>
-                </form>
-              </div>
+                            <div class=\"card\">
+                                <h2>图表分析（ECharts）</h2>
+                                <div id=\"chart\"></div>
+                                <script>
+                                    const chart = echarts.init(document.getElementById('chart'));
+                                    chart.setOption({{
+                                        title:{{text:'线索与营销趋势'}},
+                                        tooltip:{{trigger:'axis'}},
+                                        legend:{{data:['线索','消息','活动']}},
+                                        xAxis:{{type:'category', data:['线索','消息','活动']}},
+                                        yAxis:{{type:'value'}},
+                                        series:[{{name:'线索',type:'bar',data:[{summary['lead_count']}] }},{{name:'消息',type:'bar',data:[{summary['message_count']}] }},{{name:'活动',type:'bar',data:[{summary['campaign_count']}]}}]
+                                    }});
+                                </script>
+                                <div class=\"grid\"><div>{lead_bars}</div><div>{campaign_bars}</div><div>{message_bars}</div></div>
+                            </div>
 
-              <div class=\"card\">
-                <h2>营销消息</h2>
-                <form method=\"post\" action=\"/messages\">
-                  <input name=\"channel\" placeholder=\"渠道（email/sms）\" />
-                  <textarea name=\"content\" placeholder=\"营销内容\" required></textarea>
-                  <input name=\"recipient_count\" type=\"number\" placeholder=\"目标人数\" />
-                  <select name=\"status\">
-                    <option value=\"queued\">queued</option>
-                    <option value=\"sent\">sent</option>
-                    <option value=\"failed\">failed</option>
-                  </select>
-                  <button type=\"submit\">创建消息</button>
-                </form>
-              </div>
+                            <div class=\"card\">
+                                <h2>抓取网址</h2>
+                                <p>后台每 30 秒自动抓取目标并写入数据库。建议保持北京严格过滤开启。</p>
+                                <form method=\"post\" action=\"/crawl\" enctype=\"multipart/form-data\">
+                                    <textarea name=\"targets\" rows=\"4\" placeholder=\"换行或逗号分隔网址\">{html.escape(configured_targets)}</textarea>
+                                    <input type=\"file\" name=\"urls_file\" accept=\".txt\" />
+                                    <input type=\"text\" name=\"required_region\" value=\"北京\" placeholder=\"目标区域\" />
+                                    <label style=\"display:flex;align-items:center;gap:8px;\"><input type=\"checkbox\" name=\"strict_region\" checked />仅保留目标区域企业数据</label>
+                                    <select name=\"engine\">
+                                        <option value=\"auto\">自动（优先浏览器渲染，失败回退）</option>
+                                        <option value=\"playwright\">浏览器渲染</option>
+                                        <option value=\"standard\">标准库抓取</option>
+                                    </select>
+                                    <button type=\"submit\">批量抓取并记录</button>
+                                </form>
+                                <hr style=\"margin:16px 0;border:none;border-top:1px solid #eee;\" />
+                                <h3>智能发现可抓取网址（北京）</h3>
+                                <form method=\"post\" action=\"/crawl/discover\">
+                                    <textarea name=\"candidate_targets\" rows=\"4\" placeholder=\"候选网址（可留空使用内置源）\"></textarea>
+                                    <input type=\"text\" name=\"required_region\" value=\"北京\" placeholder=\"目标区域\" />
+                                    <label style=\"display:flex;align-items:center;gap:8px;\"><input type=\"checkbox\" name=\"strict_region\" checked />仅接受目标区域结果</label>
+                                    <input type=\"number\" min=\"1\" max=\"10\" name=\"min_score\" value=\"4\" placeholder=\"最低可用评分\" />
+                                    <select name=\"engine\">
+                                        <option value=\"standard\">标准库抓取</option>
+                                        <option value=\"auto\">自动（优先浏览器渲染）</option>
+                                        <option value=\"playwright\">浏览器渲染</option>
+                                    </select>
+                                    <label style=\"display:flex;align-items:center;gap:8px;\"><input type=\"checkbox\" name=\"crawl_after_discovery\" checked />发现后立即抓取一轮</label>
+                                    <button type=\"submit\">分析并追加可用网址</button>
+                                </form>
+                            </div>
 
-              <div class=\"card\">
-                <h2>用户与角色</h2>
-                <form method=\"post\" action=\"/users\">
-                  <input name=\"username\" placeholder=\"用户名\" required />
-                  <input name=\"password\" placeholder=\"密码\" required />
-                  <select name=\"role\">
-                    <option value=\"admin\">admin</option>
-                    <option value=\"manager\">manager</option>
-                    <option value=\"viewer\">viewer</option>
-                  </select>
-                  <button type=\"submit\">创建用户</button>
-                </form>
-              </div>
+                            <div class=\"card\">
+                                <h2>目标网址健康度</h2>
+                                <form method="post" action="/crawl/prune-paused" style="max-width:280px;margin-bottom:10px;">
+                                    <button type="submit">一键清理已暂停目标</button>
+                                </form>
+                                <form method="post" action="/crawl/revive-paused" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:10px;">
+                                    <input type="text" name="required_region" value="北京" placeholder="目标区域" />
+                                    <input type="number" min="1" max="10" name="min_score" value="4" placeholder="最低恢复评分" />
+                                    <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" name="strict_region" checked />严格区域</label>
+                                    <button type="submit">复检并恢复暂停目标</button>
+                                </form>
+                                <table><thead><tr><th>URL</th><th>成功</th><th>失败</th><th>连续失败</th><th>过滤</th><th>均分</th><th>暂停</th><th>暂停原因</th><th>最近状态</th></tr></thead><tbody>{target_rows}</tbody></table>
+                            </div>
 
-              <div class=\"card\">
-                <h2>抓取网址</h2>
-                <p>后台会每 30 秒自动抓取下面的目标并写入数据库。</p>
-                <form method="post" action="/crawl" enctype="multipart/form-data">
-                  <textarea name="targets" rows="4" placeholder="可一次输入多个网址，换行或逗号分隔，例如：https://example.com&#10;https://baidu.com">{html.escape(configured_targets)}</textarea>
-                  <input type="file" name="urls_file" accept=".txt" />
-                  <input type="text" name="upload_hint" placeholder="也可以上传 .txt 文件，系统会读取每行/每逗号分隔的目标" />
-                  <select name="engine">
-                    <option value="auto">自动（优先浏览器渲染，失败回退）</option>
-                    <option value="playwright">浏览器渲染</option>
-                    <option value="standard">标准库抓取</option>
-                  </select>
-                  <button type="submit">批量抓取并记录</button>
-                </form>
-              </div>
+                            <div class=\"card\">
+                                <h2>后台抓取状态</h2>
+                                <p>最近一轮：成功 {latest_cycle['processed']}，失败 {latest_cycle['failed']}，总计 {latest_cycle['total']}</p>
+                                <form method=\"post\" action=\"/crawler/toggle\" style=\"max-width:260px;\"><button type=\"submit\">{crawler_button_label}</button></form>
+                            </div>
 
-              <div class="card">
-                <h2>后台抓取状态</h2>
-                <p>最近一轮：成功 {latest_cycle['processed']}，失败 {latest_cycle['failed']}，总计 {latest_cycle['total']}</p>
-                <form method="post" action="/crawler/toggle" style="max-width: 260px; margin-top: 12px;">
-                  <button type="submit">{crawler_button_label}</button>
-                </form>
-                <p>最近 8 条后台抓取事件：</p>
-                <table><thead><tr><th>动作</th><th>详情</th><th>时间</th></tr></thead><tbody>{crawl_status_rows}</tbody></table>
-              </div>
-
-              <div class=\"card\">
-                <h2>线索列表</h2><table><thead><tr><th>姓名</th><th>公司</th><th>状态</th><th>来源</th><th>创建时间</th></tr></thead><tbody>{leads_rows}</tbody></table>
-              </div>
-              <div class=\"card\">
-                <h2>营销活动</h2><table><thead><tr><th>名称</th><th>渠道</th><th>预算</th><th>状态</th></tr></thead><tbody>{campaign_rows}</tbody></table>
-              </div>
-              <div class=\"card\">
-                <h2>营销消息</h2><table><thead><tr><th>渠道</th><th>内容</th><th>目标人数</th><th>状态</th></tr></thead><tbody>{message_rows}</tbody></table>
-              </div>
-              <div class=\"card\">
-                <h2>爬虫任务</h2><table><thead><tr><th>URL</th><th>标题</th><th>摘要/原因</th><th>状态</th></tr></thead><tbody>{crawl_rows}</tbody></table>
-              </div>
-              <div class=\"card\">
-                <h2>抓取企业资料</h2>
-                <form method="get" action="/">
-                  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;">
-                    <input name="company_name" placeholder="企业名称" value="{html.escape(company_filters['company_name'])}" />
-                    <input name="industry" placeholder="行业" value="{html.escape(company_filters['industry'])}" />
-                    <input name="region" placeholder="区域" value="{html.escape(company_filters['region'])}" />
-                    <input name="status" placeholder="状态" value="{html.escape(company_filters['status'])}" />
-                    <button type="submit">筛选</button>
-                  </div>
-                </form>
-                <table><thead><tr><th>企业</th><th>联系人</th><th>电话</th><th>邮箱</th><th>办公地址</th><th>行业</th><th>区域</th><th>状态</th></tr></thead><tbody>{company_rows}</tbody></table>
-              </div>
-              <div class=\"card\">
-                <h2>用户与角色</h2><table><thead><tr><th>用户名</th><th>角色</th><th>创建时间</th></tr></thead><tbody>{user_rows}</tbody></table>
-              </div>
-              <div class=\"card\">
-                <h2>操作日志</h2><table><thead><tr><th>动作</th><th>详情</th><th>时间</th></tr></thead><tbody>{activity_rows}</tbody></table>
-              </div>
-            </div>
-          </body>
-        </html>
-        """
+                            <div class=\"card\"><h2>爬虫任务</h2><table><thead><tr><th>URL</th><th>标题</th><th>摘要/原因</th><th>状态</th></tr></thead><tbody>{crawl_rows}</tbody></table></div>
+                            <div class=\"card\"><h2>抓取企业资料</h2>
+                                <form method=\"get\" action=\"/\"><div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;\">
+                                        <input name=\"company_name\" placeholder=\"企业名称\" value=\"{html.escape(company_filters['company_name'])}\" />
+                                        <input name=\"industry\" placeholder=\"行业\" value=\"{html.escape(company_filters['industry'])}\" />
+                                        <input name=\"region\" placeholder=\"区域\" value=\"{html.escape(company_filters['region'])}\" />
+                                        <input name=\"status\" placeholder=\"状态\" value=\"{html.escape(company_filters['status'])}\" />
+                                        <button type=\"submit\">筛选</button>
+                                </div></form>
+                                <table><thead><tr><th>企业</th><th>联系人</th><th>电话</th><th>邮箱</th><th>办公地址</th><th>行业</th><th>区域</th><th>状态</th></tr></thead><tbody>{company_rows}</tbody></table>
+                            </div>
+                            <div class=\"card\"><h2>用户与角色</h2><table><thead><tr><th>用户名</th><th>角色</th><th>创建时间</th></tr></thead><tbody>{user_rows}</tbody></table></div>
+                            <div class=\"card\"><h2>操作日志</h2><table><thead><tr><th>动作</th><th>详情</th><th>时间</th></tr></thead><tbody>{activity_rows}</tbody></table></div>
+                        </div>
+                    </body>
+                </html>
+                """
 
     def _render_company_detail(self, profile_id):
         profile = store.get_company_profile(profile_id)
