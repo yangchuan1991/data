@@ -631,12 +631,15 @@ class CRMHandler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     configured_port = os.getenv("PORT", "6000")
+    allow_port_fallback = os.getenv("CRM_ALLOW_PORT_FALLBACK", "0").lower() in {"1", "true", "yes", "on"}
     try:
         preferred_port = int(configured_port)
     except ValueError:
         preferred_port = 6000
 
-    candidate_ports = [preferred_port, preferred_port + 1, 6000, 6001, 8080, 8081, 8000, 8001, 8002]
+    candidate_ports = [preferred_port]
+    if allow_port_fallback:
+        candidate_ports.extend([preferred_port + 1, 6000, 6001, 8080, 8081, 8000, 8001, 8002])
     server = None
     last_error = None
     for port in candidate_ports:
@@ -647,5 +650,10 @@ if __name__ == "__main__":
             last_error = exc
     if server is None:
         raise last_error
+    if server.server_address[1] != preferred_port:
+        print(
+            f"Warning: server started on fallback port {server.server_address[1]} (preferred: {preferred_port})",
+            flush=True,
+        )
     print(f"Server started at http://{host}:{server.server_address[1]}")
     server.serve_forever()
