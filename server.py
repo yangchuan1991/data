@@ -5,7 +5,7 @@ import json
 import os
 import sys
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 sys.dont_write_bytecode = True
@@ -644,7 +644,7 @@ if __name__ == "__main__":
     last_error = None
     for port in candidate_ports:
         try:
-            server = HTTPServer((host, port), CRMHandler)
+            server = ThreadingHTTPServer((host, port), CRMHandler)
             break
         except OSError as exc:
             last_error = exc

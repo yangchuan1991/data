@@ -6,6 +6,7 @@ APP_DIR="${APP_DIR:-/opt/crm_project}"
 ENV_FILE="${ENV_FILE:-/etc/environment.d/crm.conf}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-8888}"
+PYTHON_BIN="${PYTHON_BIN:-${APP_DIR}/.venv/bin/python}"
 
 echo "[1/8] Service status"
 sudo systemctl --no-pager --full status "${SERVICE_NAME}" | sed -n '1,30p' || true
@@ -40,7 +41,10 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 if [[ -n "${CRM_POSTGRES_DSN:-}" ]]; then
-  python3 - <<'PY'
+  if [[ ! -x "${PYTHON_BIN}" ]]; then
+    echo "Python runtime not found: ${PYTHON_BIN}"
+  else
+    "${PYTHON_BIN}" - <<'PY'
 import os
 import psycopg2
 
@@ -53,6 +57,7 @@ try:
 except Exception as exc:
     print("DB failed:", exc)
 PY
+  fi
 else
   echo "CRM_POSTGRES_DSN is empty"
 fi

@@ -6,7 +6,7 @@ DB_NAME="crm_prod"
 DB_USER="crm_app"
 DB_PASSWORD="your-strong-password"
 PORT="8888"
-HOST="0.0.0.0"
+HOST="127.0.0.1"
 POSTGRES_DSN="postgresql://${DB_USER}:${DB_PASSWORD}@127.0.0.1:5432/${DB_NAME}"
 SOURCE_DIR="${SOURCE_DIR:-$(pwd)}"
 
